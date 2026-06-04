@@ -1,15 +1,18 @@
-# Phaser 3 + Tiled (Room Screens) Template
+# wormy
+
+An 8-bit adventure game inspired by the Oliver Twins.
+
+Built with **Phaser 3** and **Tiled**. The world map (`Maps/wholemap.json`) is laid out as adjacent screens (24×13 tiles each, 16×16 px per tile). The camera snaps between screens Dizzy-style as the player walks off the left or right edge.
 
 ## Run
 
-- Option A: open `index.html` (some browsers block fetches from `file://`, so Option B is safer)
-- Option B: run a local server:
+Some browsers block fetches from `file://`, so use a local server:
 
 ```bash
 python3 -m http.server 8080
 ```
 
-Then open `http://localhost:8080/`.
+Then open [http://localhost:8080/](http://localhost:8080/).
 
 ## Controls
 
@@ -18,69 +21,27 @@ Then open `http://localhost:8080/`.
 
 ## Tiled integration
 
-Phaser loads **Tiled JSON**, not `.tmx` directly in this template.
+Phaser loads **Tiled JSON**, not `.tmx` directly.
 
-You already have `Maps/test.tmx` — export it as JSON:
+Export your map from Tiled: **File → Export As… → JSON map files (`.json`)** → save as `Maps/wholemap.json` (or update `TILEMAP_JSON_URL` in `main.js`).
 
-- In Tiled: **File → Export As… → JSON map files (`.json`)**
-- Save as: `Maps/test.json`
+The game expects:
 
-Then place/copy your tileset image where the game can load it.
+- `Maps/wholemap.json`
+- `Tilesets/spelunky_shop.png` (set `TILESET_IMAGE_URL` in `main.js` if you use a different image)
 
-By default this template expects:
-
-- `Maps/test.json`
-- `assets/spelunky_shop.png`
-
-### External `.tsx` tilesets are supported
-
-Your `Maps/test.json` can reference external tilesets like:
-
-- `"tilesets": [{ "source": "../Tilesets/spelunky_shop.tsx" }]`
-
-This template **loads the `.tsx` as text and parses it at runtime**, so you don’t need an “embed tilesets” export option.
-
-Make sure `main.js` points at:
-
-- `TILESET_TSX_URL` → your `.tsx`
-- `TILESET_IMAGE_URL` → the tileset **image** (png/jpg) used by that `.tsx`
-
-### Tileset naming requirement
-
-In `main.js`, the code auto-detects the **first tileset name** from the map JSON and uses that.
-
-If your map uses multiple tilesets, add more `addTilesetImage(...)` calls.
+Embedded tilesets in the JSON work out of the box. External `.tsx` references are normalized at load time.
 
 ### Collision layer
 
-Mark any tile layer as collidable by setting either:
-
-- **Layer property**: `collides = true` (recommended)
-- Or name the layer **`Collisions`**
-
-For property-based collision, set the tile property:
-
-- **Tile property**: `collides = true` (on the tiles that should collide)
+Mark any tile layer as collidable with a layer property `collides = true`, or name the layer **`Collisions`**. Any non-empty tile on `Collisions` is solid.
 
 ### Spawn point (optional)
 
-Add an **Object Layer** named **`Objects`** and add an object named **`Spawn`**.
-The player spawns at that object’s `(x,y)`.
+Add an **Object Layer** named **`Objects`** with an object named **`Spawn`**. Otherwise the player spawns at `DEFAULT_SPAWN_TILE` in `main.js`.
 
-## Multiple screens / rooms (Dizzy-style)
+### Multiple screens
 
-Add an **Object Layer** named **`Rooms`**.
+Extend the map width in multiples of **24 tiles** (one screen). Screens are detected automatically; no `Rooms` layer is required unless you want irregular layouts.
 
-Create rectangle objects where each rectangle is one “screen”:
-
-- Each rectangle should be exactly the size of the camera viewport (default \(960 \times 640\))
-- Place them adjacent/overlapping however your world is laid out
-- Optionally name each rectangle (used as the room id)
-
-When `Rooms` exist:
-
-- The camera **does not follow** the player
-- It slides to the active room as the player crosses into another room rectangle
-
-Tweak the feel in `main.js` via `_updateRoomCamera()` by changing the `lerp` value.
-
+Optional: add a **`Rooms`** object layer with rectangles sized **384×208** px (24×13 tiles at 16 px) for manual screen bounds.
