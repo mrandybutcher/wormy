@@ -18,6 +18,8 @@ Then open [http://localhost:8080/](http://localhost:8080/).
 
 - **Left/Right**: move
 - **Up**: jump (only when grounded)
+- **I**: toggle inventory display
+- **D**: drop selected item from inventory
 
 ## Tiled integration
 
@@ -45,3 +47,23 @@ Add an **Object Layer** named **`Objects`** with an object named **`Spawn`**. Ot
 Extend the map width in multiples of **24 tiles** (one screen). Screens are detected automatically; no `Rooms` layer is required unless you want irregular layouts.
 
 Optional: add a **`Rooms`** object layer with rectangles sized **384×208** px (24×13 tiles at 16 px) for manual screen bounds.
+
+## Inventory System
+
+The game includes a Fantasy World Dizzy-style inventory system:
+
+- **Capacity**: 3 items maximum (classic Dizzy style)
+- **Pick up items**: Walk over items in the world to automatically collect them
+- **View inventory**: Press **I** to toggle the inventory display
+- **Drop items**: Press **D** to drop the currently selected item in front of the player
+
+### Adding Items in Tiled
+
+1. Create an **Object Layer** named **`Items`** in your Tiled map
+2. Add point or rectangle objects where you want items to appear
+3. Add a custom property to each object:
+   - Property name: `itemType`
+   - Property value: one of `key`, `coin`, `potion`, `gem`, or `apple`
+4. Alternatively, name the object with the item type (e.g., "key", "coin", etc.)
+
+Items will spawn at the object's position when the map loads.

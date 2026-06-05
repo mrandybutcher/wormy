@@ -69,20 +69,20 @@ class MainScene extends Phaser.Scene {
     this._gridCols = 1;
     this._gridRows = 1;
     this._mapEnabled = true;
+    this.inventory = [];
+    this.inventoryMaxSize = 3;
+    this.inventoryVisible = false;
+    this.inventoryUI = null;
+    this.worldItems = null;
+    this._kbdInventory = false;
+    this._kbdDrop = false;
+    this.selectedInventorySlot = 0;
   }
 
   preload() {
-    // Tiled assets (export your map as JSON)
-    // Expected (by default):
-    // - Maps/wholemap.json
-    // - assets/tiles.png
-    //
-    // If your map references a different tileset image filename, either:
-    // - rename it to tiles.png, or
-    // - change the key/path below + the tileset name in create()
-    // NOTE: If these files don't exist yet, the scene will fall back to a simple ground.
     this.load.image("tiles", TILESET_IMAGE_URL);
     this.load.json("mapJson", TILEMAP_JSON_URL);
+    this._createItemTextures();
   }
 
   create() {
@@ -223,6 +223,9 @@ class MainScene extends Phaser.Scene {
 
     cam.roundPixels = true;
 
+    this._createWorldItems();
+    this._createInventoryUI();
+
     this._bindScaleRefresh();
   }
 
@@ -246,6 +249,17 @@ class MainScene extends Phaser.Scene {
       this._jumpQueued = false;
     }
 
+    if (this._kbdInventory) {
+      this._toggleInventory();
+      this._kbdInventory = false;
+    }
+
+    if (this._kbdDrop) {
+      this._dropSelectedItem();
+      this._kbdDrop = false;
+    }
+
+    this._checkItemPickup();
     this._setActiveRoomForPlayer(false);
     this._updateRoomCamera();
   }
@@ -304,6 +318,8 @@ class MainScene extends Phaser.Scene {
     this._kbdLeft = false;
     this._kbdRight = false;
     this._jumpQueued = false;
+    this._kbdInventory = false;
+    this._kbdDrop = false;
   }
 
   /**
@@ -325,6 +341,8 @@ class MainScene extends Phaser.Scene {
       if (e.code === "ArrowLeft") this._kbdLeft = true;
       else if (e.code === "ArrowRight") this._kbdRight = true;
       else if (e.code === "ArrowUp") this._jumpQueued = true;
+      else if (e.code === "KeyI") this._kbdInventory = true;
+      else if (e.code === "KeyD") this._kbdDrop = true;
     };
 
     const onUp = (e) => {
@@ -598,6 +616,208 @@ class MainScene extends Phaser.Scene {
     if (this.roomCamTarget == null) return;
     const cam = this.cameras.main;
     cam.setScroll(this.roomCamTarget.x, this.roomCamTarget.y);
+  }
+
+  _createItemTextures() {
+    const itemDefs = this._getItemDefinitions();
+    for (const [itemId, def] of Object.entries(itemDefs)) {
+      if (!this.textures) continue;
+      const texKey = `item_${itemId}`;
+      const canvas = document.createElement("canvas");
+      canvas.width = 12;
+      canvas.height = 12;
+      const ctx = canvas.getContext("2d");
+      ctx.fillStyle = def.color;
+      ctx.fillRect(0, 0, 12, 12);
+      ctx.strokeStyle = "#000000";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(0, 0, 12, 12);
+      this.textures.addBase64(texKey, canvas.toDataURL());
+    }
+  }
+
+  _getItemDefinitions() {
+    return {
+      key: { name: "Key", color: "#FFD700" },
+      coin: { name: "Coin", color: "#FFA500" },
+      potion: { name: "Potion", color: "#FF00FF" },
+      gem: { name: "Gem", color: "#00FFFF" },
+      apple: { name: "Apple", color: "#FF0000" },
+    };
+  }
+
+  _createWorldItems() {
+    this.worldItems = this.physics.add.group();
+
+    if (!this._mapEnabled || !this.map) {
+      const fallbackItems = [
+        { x: 200, y: 580, type: "key" },
+        { x: 300, y: 580, type: "coin" },
+        { x: 400, y: 580, type: "potion" },
+      ];
+      for (const itemData of fallbackItems) {
+        this._createWorldItem(itemData.x, itemData.y, itemData.type);
+      }
+      return;
+    }
+
+    const itemsLayer = this.map.getObjectLayer("Items");
+    if (!itemsLayer || !itemsLayer.objects) return;
+
+    for (const obj of itemsLayer.objects) {
+      const itemType = obj.properties?.find((p) => p.name === "itemType")?.value || obj.name || "key";
+      const x = this._tiledObjectCenterX(obj, this.map.tileWidth);
+      const y = this._tiledObjectFootY(obj);
+      this._createWorldItem(x, y, itemType);
+    }
+  }
+
+  _createWorldItem(x, y, itemType) {
+    const texKey = `item_${itemType}`;
+    if (!this.textures.exists(texKey)) return;
+
+    const item = this.physics.add.sprite(x, y, texKey);
+    item.setOrigin(0.5, 1);
+    item.body.setAllowGravity(false);
+    item.body.setImmovable(true);
+    item.setData("itemType", itemType);
+
+    this.worldItems.add(item);
+  }
+
+  _checkItemPickup() {
+    if (!this.player || !this.worldItems) return;
+
+    this.physics.overlap(this.player, this.worldItems, (player, item) => {
+      if (this.inventory.length < this.inventoryMaxSize) {
+        const itemType = item.getData("itemType");
+        this.inventory.push(itemType);
+        item.destroy();
+        this._updateInventoryUI();
+      }
+    });
+  }
+
+  _createInventoryUI() {
+    if (this.inventoryUI) {
+      this.inventoryUI.destroy();
+    }
+
+    this.inventoryUI = this.add.container(0, 0);
+    this.inventoryUI.setScrollFactor(0);
+    this.inventoryUI.setDepth(10000);
+    this.inventoryUI.setVisible(false);
+
+    const panelWidth = 200;
+    const panelHeight = 120;
+    const panelX = (SCREEN_PIXEL_WIDTH - panelWidth) / 2;
+    const panelY = 20;
+
+    const bg = this.add.rectangle(panelX, panelY, panelWidth, panelHeight, 0x1a1a2e);
+    bg.setOrigin(0, 0);
+    bg.setStrokeStyle(2, 0xffffff);
+
+    const title = this.add.text(panelX + panelWidth / 2, panelY + 10, "INVENTORY", {
+      fontFamily: "ui-monospace, monospace",
+      fontSize: "12px",
+      color: "#ffffff",
+    });
+    title.setOrigin(0.5, 0);
+
+    this.inventoryUI.add([bg, title]);
+    this.inventoryUI.setData("panelX", panelX);
+    this.inventoryUI.setData("panelY", panelY);
+    this.inventoryUI.setData("slotSprites", []);
+
+    this._updateInventoryUI();
+  }
+
+  _updateInventoryUI() {
+    if (!this.inventoryUI) return;
+
+    const slotSprites = this.inventoryUI.getData("slotSprites") || [];
+    for (const sprite of slotSprites) {
+      sprite.destroy();
+    }
+    slotSprites.length = 0;
+
+    const panelX = this.inventoryUI.getData("panelX");
+    const panelY = this.inventoryUI.getData("panelY");
+    const itemDefs = this._getItemDefinitions();
+
+    for (let i = 0; i < this.inventoryMaxSize; i++) {
+      const slotX = panelX + 30 + i * 50;
+      const slotY = panelY + 50;
+
+      const slotBg = this.add.rectangle(slotX, slotY, 40, 40, 0x2d2d44);
+      slotBg.setOrigin(0.5, 0.5);
+      slotBg.setStrokeStyle(i === this.selectedInventorySlot ? 2 : 1, i === this.selectedInventorySlot ? 0xffff00 : 0x666666);
+      this.inventoryUI.add(slotBg);
+      slotSprites.push(slotBg);
+
+      if (i < this.inventory.length) {
+        const itemType = this.inventory[i];
+        const texKey = `item_${itemType}`;
+        if (this.textures.exists(texKey)) {
+          const itemSprite = this.add.sprite(slotX, slotY, texKey);
+          itemSprite.setScale(2);
+          this.inventoryUI.add(itemSprite);
+          slotSprites.push(itemSprite);
+
+          const def = itemDefs[itemType];
+          if (def) {
+            const itemName = this.add.text(slotX, slotY + 30, def.name, {
+              fontFamily: "ui-monospace, monospace",
+              fontSize: "8px",
+              color: "#ffffff",
+            });
+            itemName.setOrigin(0.5, 0);
+            this.inventoryUI.add(itemName);
+            slotSprites.push(itemName);
+          }
+        }
+      }
+    }
+
+    const helpText = this.add.text(panelX + 100, panelY + 105, "I: Toggle | D: Drop Selected", {
+      fontFamily: "ui-monospace, monospace",
+      fontSize: "8px",
+      color: "#aaaaaa",
+    });
+    helpText.setOrigin(0.5, 0);
+    this.inventoryUI.add(helpText);
+    slotSprites.push(helpText);
+
+    this.inventoryUI.setData("slotSprites", slotSprites);
+  }
+
+  _toggleInventory() {
+    if (!this.inventoryUI) return;
+    this.inventoryVisible = !this.inventoryVisible;
+    this.inventoryUI.setVisible(this.inventoryVisible);
+    if (this.inventoryVisible) {
+      this._updateInventoryUI();
+    }
+  }
+
+  _dropSelectedItem() {
+    if (this.inventory.length === 0) return;
+    if (this.selectedInventorySlot >= this.inventory.length) {
+      this.selectedInventorySlot = 0;
+    }
+
+    const itemType = this.inventory[this.selectedInventorySlot];
+    this.inventory.splice(this.selectedInventorySlot, 1);
+
+    const dropX = this.player.x + (this.player.flipX ? -20 : 20);
+    const dropY = this.player.y;
+    this._createWorldItem(dropX, dropY, itemType);
+
+    if (this.selectedInventorySlot >= this.inventory.length && this.selectedInventorySlot > 0) {
+      this.selectedInventorySlot--;
+    }
+
+    this._updateInventoryUI();
   }
 }
 
