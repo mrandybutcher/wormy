@@ -19,6 +19,30 @@ Then open [http://localhost:8080/](http://localhost:8080/).
 - **Left/Right**: move
 - **Up**: jump (only when grounded)
 
+## Animated Sprites
+
+The player character now uses animated sprites! The character animates when moving and shows an idle frame when standing still.
+
+### Using Your Own Sprite
+
+1. **Quick setup** (recommended):
+   ```bash
+   ./setup_sprite.sh your_sprite.png 2 2
+   ```
+
+2. **Manual setup**:
+   - Save your sprite sheet to `assets/`
+   - Run: `python3 split_sprite.py assets/your_sprite.png [cols] [frames]`
+   - Update `main.js` to reference your sprite file
+   - See `SPRITE_INSTRUCTIONS.md` for detailed steps
+
+### Sprite Requirements
+
+- **Size**: 16×16 pixels per frame (matches game tiles)
+- **Format**: PNG with transparency
+- **Layout**: Horizontal strip or grid layout
+- **Frames**: 2+ frames for smooth animation
+
 ## Tiled integration
 
 Phaser loads **Tiled JSON**, not `.tmx` directly.
