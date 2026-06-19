@@ -210,11 +210,18 @@ class MainScene extends Phaser.Scene {
     this.load.image("tiles", TILESET_IMAGE_URL);
     this.load.image("item_key", "assets/key.png");
     this.load.json("mapJson", TILEMAP_JSON_URL);
+    
+    // Load player sprite sheet (2 frames, 16x16 each)
+    this.load.spritesheet("player", "assets/sprite_sheet_sample.png", {
+      frameWidth: 16,
+      frameHeight: 16
+    });
   }
 
   create() {
     this._ensurePlayerTexture();
     this._createItemTextures();
+    this._createPlayerAnimations();
 
     this.cameras.main.setBackgroundColor(0x121926);
 
@@ -415,6 +422,18 @@ class MainScene extends Phaser.Scene {
       }
     }
 
+    const isMoving = !this.inventoryVisible && (WORMY_KEYS.left || WORMY_KEYS.right);
+    if (isMoving) {
+      if (this.player.anims && !this.player.anims.isPlaying) {
+        this.player.play("player_walk", true);
+      }
+    } else {
+      if (this.player.anims) {
+        this.player.stop();
+        this.player.setFrame(0);
+      }
+    }
+
     const onGround = body.blocked.down || body.touching.down;
     if (!this.inventoryVisible && onGround && WORMY_KEYS.jumpQueued) {
       body.setVelocityY(-PHYS_JUMP_VELOCITY);
@@ -524,6 +543,19 @@ class MainScene extends Phaser.Scene {
     tex.context.fillStyle = "#5fd38d";
     tex.context.fillRect(0, 0, PLAYER_WIDTH, PLAYER_HEIGHT);
     tex.refresh();
+  }
+
+  _createPlayerAnimations() {
+    if (!this.textures.exists("player")) return;
+    if (this.anims.exists("player_walk")) return;
+    
+    // Create walking animation using both frames
+    this.anims.create({
+      key: "player_walk",
+      frames: this.anims.generateFrameNumbers("player", { start: 0, end: 1 }),
+      frameRate: 8,
+      repeat: -1
+    });
   }
 
   _normalizeTiledTilesets(mapJson) {
