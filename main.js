@@ -47,16 +47,129 @@ const SCREEN_PIXEL_HEIGHT = SCREEN_TILE_HEIGHT * 16;
 const VIEW_ZOOM = 1;
 const GAME_WIDTH = SCREEN_PIXEL_WIDTH * VIEW_ZOOM;
 const GAME_HEIGHT = SCREEN_PIXEL_HEIGHT * VIEW_ZOOM;
+const ITEM_PICKUP_MARGIN = 12;
+const INTERACTIONS_LAYER_NAME = "Interactions";
+const INTERACTION_USE_MARGIN = 12;
+
+const MAX_ENERGY = 50;
+const START_ENERGY = MAX_ENERGY;
+const START_LIVES = 3;
+const RESPAWN_INVULN_MS = 2000;
+/** Falls shorter than this (px) do not drain energy. */
+const FALL_DAMAGE_MIN_PX = 48;
+const FALL_DAMAGE_ENERGY_PER_PX = 0.35;
+
+/**
+ * Registered interaction actions. Add new entries here for custom behaviour.
+ * Each handler receives (scene, interaction) and returns true on success.
+ */
+const INTERACTION_HANDLERS = {
+  unlock_door(scene, interaction) {
+    const rect = scene._getInteractionTargetRect(interaction.target);
+    if (!rect) return false;
+    scene._disableHorizontalCollisionInRect(rect);
+    scene._showGameMessage("The door unlocks.");
+    return true;
+  },
+  /** Erases tiles on named layer(s) inside `target`. Optional property `layer` (default `Collisions`). */
+  hide_tiles(scene, interaction) {
+    const rect = scene._getInteractionTargetRect(interaction.target);
+    if (!rect) return false;
+    const layerNames = (interaction.layer || "Collisions").split(",").map((s) => s.trim());
+    for (const layerName of layerNames) {
+      scene._removeTilesInRectOnLayer(layerName, rect);
+    }
+    scene._showGameMessage("It opens.");
+    return true;
+  },
+  /** Walk-through + remove door collision tiles above the floor in `target` (Background unchanged). */
+  open_door(scene, interaction) {
+    const rect = scene._getInteractionTargetRect(interaction.target);
+    if (!rect) return false;
+    scene._disableHorizontalCollisionInRect(rect);
+    scene._removeDoorTilesInRect(rect, ["Collisions"]);
+    scene._showGameMessage("The door opens.");
+    return true;
+  },
+  light_fire(scene, interaction) {
+    const rect = scene._getInteractionTargetRect(interaction.target) ?? interaction.bounds;
+    scene._spawnFireEffect(rect.centerX, rect.bottom);
+    scene._showGameMessage("You light a fire.");
+    return true;
+  },
+};
+
+/** Module-level key state — window listeners always update the live scene (no stale `this`). */
+const WORMY_KEYS = {
+  left: false,
+  right: false,
+  jumpQueued: false,
+  enterQueued: false,
+  escQueued: false,
+  invNavDir: null,
+};
+
+let wormyActiveScene = null;
+
+function installWormyKeyboard() {
+  if (installWormyKeyboard.done) return;
+  installWormyKeyboard.done = true;
+
+  const captured = ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Enter", "Escape"];
+  const shouldCapture = (code) => captured.includes(code);
+
+  const clearKeys = () => {
+    WORMY_KEYS.left = false;
+    WORMY_KEYS.right = false;
+    WORMY_KEYS.jumpQueued = false;
+    WORMY_KEYS.enterQueued = false;
+    WORMY_KEYS.escQueued = false;
+    WORMY_KEYS.invNavDir = null;
+  };
+
+    const onDown = (e) => {
+    if (shouldCapture(e.code)) e.preventDefault();
+    if (e.repeat) return;
+
+    if (e.code === "ArrowLeft") {
+      WORMY_KEYS.left = true;
+      WORMY_KEYS.invNavDir = "left";
+    } else if (e.code === "ArrowRight") {
+      WORMY_KEYS.right = true;
+      WORMY_KEYS.invNavDir = "right";
+    } else if (e.code === "ArrowUp") {
+      WORMY_KEYS.invNavDir = "up";
+      WORMY_KEYS.jumpQueued = true;
+    } else if (e.code === "ArrowDown") {
+      WORMY_KEYS.invNavDir = "down";
+    } else if (e.code === "Enter") {
+      WORMY_KEYS.enterQueued = true;
+    } else if (e.code === "Escape") {
+      WORMY_KEYS.escQueued = true;
+    }
+  };
+
+  const onUp = (e) => {
+    if (shouldCapture(e.code)) e.preventDefault();
+    if (e.code === "ArrowLeft") WORMY_KEYS.left = false;
+    else if (e.code === "ArrowRight") WORMY_KEYS.right = false;
+  };
+
+  window.addEventListener("keydown", onDown, { capture: true, passive: false });
+  window.addEventListener("keyup", onUp, { capture: true, passive: false });
+  window.addEventListener("blur", clearKeys, { passive: true });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible") clearKeys();
+  }, { passive: true });
+}
+
+installWormyKeyboard();
 
 class MainScene extends Phaser.Scene {
   constructor() {
     super("main");
     this.player = null;
     this.map = null;
-    /** DOM-tracked keys (Chrome can desync Phaser’s Key.isDown from real hardware). */
-    this._kbdLeft = false;
-    this._kbdRight = false;
-    this._jumpQueued = false;
     this.rooms = [];
     /** true → object layer "Rooms" in Tiled; false → screens auto-tiled from map + zoom viewport */
     this._roomsFromTiled = false;
@@ -74,19 +187,34 @@ class MainScene extends Phaser.Scene {
     this.inventoryVisible = false;
     this.inventoryUI = null;
     this.worldItems = null;
-    this._kbdInventory = false;
-    this._kbdDrop = false;
+    this.interactions = [];
+    this.interactionTargets = new Map();
+    this.collidableLayers = [];
+    /** TilemapLayer instances by Tiled layer name (for removeTileAt etc.). */
+    this.tilemapLayersByName = new Map();
     this.selectedInventorySlot = 0;
+    this._inventoryReturnSlot = 0;
+    this.spawnX = 0;
+    this.spawnY = 0;
+    this.energy = START_ENERGY;
+    this.lives = START_LIVES;
+    this.statusUI = null;
+    this._livesText = null;
+    this._energyBarFill = null;
+    this._isDead = false;
+    this._invulnerableUntil = 0;
+    this._airbornePeakY = null;
   }
 
   preload() {
     this.load.image("tiles", TILESET_IMAGE_URL);
+    this.load.image("item_key", "assets/key.png");
     this.load.json("mapJson", TILEMAP_JSON_URL);
-    this._createItemTextures();
   }
 
   create() {
     this._ensurePlayerTexture();
+    this._createItemTextures();
 
     this.cameras.main.setBackgroundColor(0x121926);
 
@@ -134,7 +262,10 @@ class MainScene extends Phaser.Scene {
     for (const layerDef of this.map.layers) {
       const layerName = layerDef.name;
       const layer = this.map.createLayer(layerName, tilesetInstances, 0, 0);
-      if (layer) createdLayers.push(layer);
+      if (layer) {
+        createdLayers.push(layer);
+        this.tilemapLayersByName.set(layerName, layer);
+      }
     }
 
     // World bounds based on map pixel size
@@ -192,8 +323,9 @@ class MainScene extends Phaser.Scene {
     for (const layer of collidableLayers) {
       this.physics.add.collider(this.player, layer);
     }
+    this.collidableLayers = collidableLayers;
 
-    this._setupDomKeyboard();
+    this._setupInput();
 
     // Discrete screens (Dizzy-style): camera never smoothly follows — it stays fixed per screen or snaps instantly.
     // Optional: object layer "Rooms" with rectangles in map pixels matching one visible area at current VIEW_ZOOM.
@@ -224,42 +356,73 @@ class MainScene extends Phaser.Scene {
     cam.roundPixels = true;
 
     this._createWorldItems();
+    this._createInteractions();
+    this._initPlayerStats(spawnX, spawnY);
     this._createInventoryUI();
+    this._createStatusUI();
 
     this._bindScaleRefresh();
+    this._focusGameCanvas();
   }
 
   update() {
     if (!this.player) return;
     const body = this.player.body;
+
+    if (this._isDead) {
+      body.setVelocity(0, 0);
+      return;
+    }
+
     body.setAccelerationX(0);
-    if (this._kbdLeft) {
-      body.setVelocityX(-PHYS_WALK_SPEED_X);
-      this.player.setFlipX(true);
-    } else if (this._kbdRight) {
-      body.setVelocityX(PHYS_WALK_SPEED_X);
-      this.player.setFlipX(false);
-    } else {
+
+    if (WORMY_KEYS.enterQueued) {
+      try {
+        if (this.inventoryVisible) {
+          this._handleInventoryReturn();
+        } else if (this._pickupNearbyItem()) {
+          this._openInventory({ justPickedUp: true });
+        } else {
+          this._openInventory();
+        }
+      } finally {
+        WORMY_KEYS.enterQueued = false;
+      }
+    }
+
+    if (WORMY_KEYS.escQueued) {
+      if (this.inventoryVisible) this._closeInventory();
+      WORMY_KEYS.escQueued = false;
+    }
+
+    if (this.inventoryVisible) {
       body.setVelocityX(0);
+      if (WORMY_KEYS.invNavDir) {
+        this._moveInventoryNav(WORMY_KEYS.invNavDir);
+        WORMY_KEYS.invNavDir = null;
+      }
+      WORMY_KEYS.jumpQueued = false;
+    } else {
+      if (WORMY_KEYS.invNavDir) WORMY_KEYS.invNavDir = null;
+      if (WORMY_KEYS.left) {
+        body.setVelocityX(-PHYS_WALK_SPEED_X);
+        this.player.setFlipX(true);
+      } else if (WORMY_KEYS.right) {
+        body.setVelocityX(PHYS_WALK_SPEED_X);
+        this.player.setFlipX(false);
+      } else {
+        body.setVelocityX(0);
+      }
     }
 
     const onGround = body.blocked.down || body.touching.down;
-    if (onGround && this._jumpQueued) {
+    if (!this.inventoryVisible && onGround && WORMY_KEYS.jumpQueued) {
       body.setVelocityY(-PHYS_JUMP_VELOCITY);
-      this._jumpQueued = false;
+      WORMY_KEYS.jumpQueued = false;
     }
 
-    if (this._kbdInventory) {
-      this._toggleInventory();
-      this._kbdInventory = false;
-    }
+    this._updateFallDamage(onGround);
 
-    if (this._kbdDrop) {
-      this._dropSelectedItem();
-      this._kbdDrop = false;
-    }
-
-    this._checkItemPickup();
     this._setActiveRoomForPlayer(false);
     this._updateRoomCamera();
   }
@@ -281,7 +444,9 @@ class MainScene extends Phaser.Scene {
     this.player.setMaxVelocity(PHYS_WALK_SPEED_X, PHYS_MAX_SPEED_Y);
 
     this.physics.add.collider(this.player, ground);
-    this._setupDomKeyboard();
+    this._setupInput();
+    this._initPlayerStats(140, h - 120);
+    this._createStatusUI();
 
     const cam = this.cameras.main;
     cam.stopFollow();
@@ -312,63 +477,25 @@ class MainScene extends Phaser.Scene {
     }
 
     this._bindScaleRefresh();
+    this._focusGameCanvas();
   }
 
-  _clearDomKeyboardState() {
-    this._kbdLeft = false;
-    this._kbdRight = false;
-    this._jumpQueued = false;
-    this._kbdInventory = false;
-    this._kbdDrop = false;
+  _focusGameCanvas() {
+    const canvas = this.game.canvas;
+    if (!canvas) return;
+    canvas.setAttribute("tabindex", "0");
+    canvas.style.outline = "none";
+    if (!this._canvasFocusInstalled) {
+      this._canvasFocusInstalled = true;
+      canvas.addEventListener("pointerdown", () => canvas.focus(), { passive: true });
+    }
+    canvas.focus();
   }
 
-  /**
-   * Track arrows via window keydown/keyup (capture + preventDefault). Phaser’s keyboard stack can miss keyup in Chrome.
-   */
-  _setupDomKeyboard() {
-    if (this._domKbdInstalled) return;
-    this._domKbdInstalled = true;
-
-    const arrowCodes = ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"];
-    const shouldPrevent = (code) => arrowCodes.includes(code);
-
-    const onDown = (e) => {
-      if (shouldPrevent(e.code)) e.preventDefault();
-
-      // OS key-repeat: ignore repeated keydown — state is already “held”; avoids odd double edges.
-      if (e.repeat) return;
-
-      if (e.code === "ArrowLeft") this._kbdLeft = true;
-      else if (e.code === "ArrowRight") this._kbdRight = true;
-      else if (e.code === "ArrowUp") this._jumpQueued = true;
-      else if (e.code === "KeyI") this._kbdInventory = true;
-      else if (e.code === "KeyD") this._kbdDrop = true;
-    };
-
-    const onUp = (e) => {
-      if (shouldPrevent(e.code)) e.preventDefault();
-      if (e.code === "ArrowLeft") this._kbdLeft = false;
-      else if (e.code === "ArrowRight") this._kbdRight = false;
-    };
-
-    const onBlurOrHide = () => this._clearDomKeyboardState();
-
-    window.addEventListener("keydown", onDown, { capture: true, passive: false });
-    window.addEventListener("keyup", onUp, { capture: true, passive: false });
-    window.addEventListener("blur", onBlurOrHide, { passive: true });
-
-    const onVisibility = () => {
-      if (document.visibilityState !== "visible") onBlurOrHide();
-    };
-    document.addEventListener("visibilitychange", onVisibility);
-
+  _setupInput() {
+    wormyActiveScene = this;
     this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
-      window.removeEventListener("keydown", onDown, { capture: true });
-      window.removeEventListener("keyup", onUp, { capture: true });
-      window.removeEventListener("blur", onBlurOrHide, { passive: true });
-      document.removeEventListener("visibilitychange", onVisibility);
-      this._domKbdInstalled = false;
-      this._clearDomKeyboardState();
+      if (wormyActiveScene === this) wormyActiveScene = null;
     });
   }
 
@@ -433,6 +560,18 @@ class MainScene extends Phaser.Scene {
         tileheight: tileHeight,
         tilewidth: tileWidth,
       };
+    });
+
+    // Tiled allows the same tileset name on multiple firstgid blocks (one per screen).
+    // Phaser resolves addTilesetImage by name — duplicates break GIDs on later screens.
+    const finalNames = new Set();
+    normalized.tilesets = normalized.tilesets.map((tileset) => {
+      let name = tileset.name || `tileset_${tileset.firstgid}`;
+      if (finalNames.has(name)) {
+        name = this._uniqueTilesetName(name, finalNames, tileset.firstgid);
+      }
+      finalNames.add(name);
+      return { ...tileset, name };
     });
 
     return normalized;
@@ -623,6 +762,7 @@ class MainScene extends Phaser.Scene {
     for (const [itemId, def] of Object.entries(itemDefs)) {
       if (!this.textures) continue;
       const texKey = `item_${itemId}`;
+      if (this.textures.exists(texKey)) continue;
       const canvas = document.createElement("canvas");
       canvas.width = 12;
       canvas.height = 12;
@@ -636,9 +776,401 @@ class MainScene extends Phaser.Scene {
     }
   }
 
+  _getTiledProperty(obj, name, defaultValue) {
+    const prop = obj.properties?.find((p) => p.name === name);
+    if (!prop || prop.value === undefined) return defaultValue;
+    return prop.value;
+  }
+
+  _tiledObjectWorldRect(obj) {
+    const margin = INTERACTION_USE_MARGIN;
+    if (obj.width && obj.height) {
+      return new Phaser.Geom.Rectangle(obj.x, obj.y, obj.width, obj.height);
+    }
+    return new Phaser.Geom.Rectangle(obj.x - margin, obj.y - margin, margin * 2, margin * 2);
+  }
+
+  _createInteractions() {
+    this.interactions = [];
+    this.interactionTargets = new Map();
+
+    if (!this._mapEnabled || !this.map) return;
+
+    const layer = this.map.getObjectLayer(INTERACTIONS_LAYER_NAME);
+    if (!layer?.objects) return;
+
+    for (const obj of layer.objects) {
+      if (obj.name) {
+        this.interactionTargets.set(obj.name, this._tiledObjectWorldRect(obj));
+      }
+
+      const action = this._getTiledProperty(obj, "action", "");
+      if (!action) continue;
+
+      const initialState = this._getTiledProperty(obj, "initialState", "default");
+      this.interactions.push({
+        id: obj.id,
+        name: obj.name || `interaction_${obj.id}`,
+        bounds: this._tiledObjectWorldRect(obj),
+        requiredItem: this._getTiledProperty(obj, "requiredItem", ""),
+        action,
+        consumeItem: this._getTiledProperty(obj, "consumeItem", true),
+        target: this._getTiledProperty(obj, "target", ""),
+        layer: this._getTiledProperty(obj, "layer", ""),
+        initialState,
+        requiredState: this._getTiledProperty(obj, "requiredState", initialState),
+        resultState: this._getTiledProperty(obj, "resultState", ""),
+        once: this._getTiledProperty(obj, "once", true),
+        state: initialState,
+      });
+    }
+  }
+
+  _getInteractionTargetRect(targetName) {
+    if (!targetName) return null;
+    return this.interactionTargets.get(targetName) ?? null;
+  }
+
+  _findNearbyInteraction() {
+    if (!this.player || this.interactions.length === 0) return null;
+
+    const playerBounds = this.player.getBounds();
+    Phaser.Geom.Rectangle.Inflate(playerBounds, INTERACTION_USE_MARGIN, INTERACTION_USE_MARGIN);
+
+    let nearest = null;
+    let nearestDistance = Number.POSITIVE_INFINITY;
+
+    for (const interaction of this.interactions) {
+      if (!Phaser.Geom.Intersects.RectangleToRectangle(playerBounds, interaction.bounds)) continue;
+      const distance = Phaser.Math.Distance.Between(
+        this.player.x,
+        this.player.y,
+        interaction.bounds.centerX,
+        interaction.bounds.centerY,
+      );
+      if (distance < nearestDistance) {
+        nearest = interaction;
+        nearestDistance = distance;
+      }
+    }
+
+    return nearest;
+  }
+
+  _canUseInteraction(interaction, itemType) {
+    if (!interaction.requiredItem || interaction.requiredItem !== itemType) return false;
+    if (interaction.once && interaction.state !== interaction.requiredState) return false;
+    if (interaction.requiredState && interaction.state !== interaction.requiredState) return false;
+    return Boolean(INTERACTION_HANDLERS[interaction.action]);
+  }
+
+  _tryUseNearbyInteraction(itemType, inventorySlot = null) {
+    if (!itemType) return false;
+
+    const interaction = this._findNearbyInteraction();
+    if (!interaction || !this._canUseInteraction(interaction, itemType)) return false;
+
+    const handler = INTERACTION_HANDLERS[interaction.action];
+    if (!handler(this, interaction)) return false;
+
+    if (interaction.resultState) interaction.state = interaction.resultState;
+    if (interaction.consumeItem !== false) {
+      this._removeInventoryItem(itemType, inventorySlot);
+    }
+
+    return true;
+  }
+
+  _removeInventoryItem(itemType, preferredSlot = null) {
+    let idx = -1;
+    if (
+      preferredSlot != null &&
+      preferredSlot < this.inventory.length &&
+      this.inventory[preferredSlot] === itemType
+    ) {
+      idx = preferredSlot;
+    } else {
+      idx = this.inventory.indexOf(itemType);
+    }
+    if (idx === -1) return;
+
+    this.inventory.splice(idx, 1);
+    if (this.selectedInventorySlot >= this.inventory.length && this.selectedInventorySlot > 0) {
+      this.selectedInventorySlot--;
+    }
+    if (this.inventoryUI) this._updateInventoryUI();
+  }
+
+  /**
+   * Remove left/right blocking so the player can walk through a doorway.
+   * Keeps up/down collision so floor tiles in the same rectangle stay solid.
+   */
+  _disableHorizontalCollisionInRect(worldRect) {
+    if (!this.collidableLayers?.length) return;
+
+    const tw = this.map.tileWidth;
+    const th = this.map.tileHeight;
+    const left = Math.floor(worldRect.left / tw);
+    const right = Math.ceil(worldRect.right / tw) - 1;
+    const top = Math.floor(worldRect.top / th);
+    const bottom = Math.ceil(worldRect.bottom / th) - 1;
+
+    for (const layer of this.collidableLayers) {
+      for (let ty = top; ty <= bottom; ty++) {
+        for (let tx = left; tx <= right; tx++) {
+          const tile = layer.getTileAt(tx, ty);
+          if (!tile || tile.index === -1) continue;
+          tile.setCollision(false, false, tile.collideUp, tile.collideDown);
+        }
+      }
+    }
+  }
+
+  _removeTilesInRectOnLayer(layerName, worldRect) {
+    const layer = this.tilemapLayersByName.get(layerName);
+    if (!layer) return;
+
+    const tw = this.map.tileWidth;
+    const th = this.map.tileHeight;
+    const left = Math.floor(worldRect.left / tw);
+    const right = Math.ceil(worldRect.right / tw) - 1;
+    const top = Math.floor(worldRect.top / th);
+    const bottom = Math.ceil(worldRect.bottom / th) - 1;
+
+    for (let ty = top; ty <= bottom; ty++) {
+      for (let tx = left; tx <= right; tx++) {
+        layer.removeTileAt(tx, ty);
+      }
+    }
+  }
+
+  /**
+   * Erase door tiles inside `worldRect` while keeping the bottom solid row per column
+   * (the floor the player stands on).
+   */
+  _removeDoorTilesInRect(worldRect, layerNames) {
+    const collisionLayer = this.tilemapLayersByName.get("Collisions");
+    if (!collisionLayer) return;
+
+    const tw = this.map.tileWidth;
+    const th = this.map.tileHeight;
+    const left = Math.floor(worldRect.left / tw);
+    const right = Math.ceil(worldRect.right / tw) - 1;
+    const top = Math.floor(worldRect.top / th);
+    const bottom = Math.ceil(worldRect.bottom / th) - 1;
+
+    const floorRowByColumn = new Map();
+    for (let tx = left; tx <= right; tx++) {
+      let floorRow = null;
+      for (let ty = bottom; ty >= top; ty--) {
+        const tile = collisionLayer.getTileAt(tx, ty);
+        if (tile && tile.index !== -1) {
+          floorRow = ty;
+          break;
+        }
+      }
+      floorRowByColumn.set(tx, floorRow);
+    }
+
+    for (const layerName of layerNames) {
+      const layer = this.tilemapLayersByName.get(layerName);
+      if (!layer) continue;
+
+      for (let tx = left; tx <= right; tx++) {
+        const floorRow = floorRowByColumn.get(tx);
+        if (floorRow == null) continue;
+
+        for (let ty = top; ty < floorRow; ty++) {
+          layer.removeTileAt(tx, ty);
+        }
+      }
+    }
+  }
+
+  _spawnFireEffect(x, y) {
+    if (!this.textures.exists("fire")) {
+      const tex = this.textures.createCanvas("fire", 12, 16);
+      tex.context.fillStyle = "#ff6600";
+      tex.context.fillRect(2, 4, 8, 10);
+      tex.context.fillStyle = "#ffcc00";
+      tex.context.fillRect(4, 2, 4, 8);
+      tex.refresh();
+    }
+
+    const fire = this.add.sprite(x, y, "fire");
+    fire.setOrigin(0.5, 1);
+    fire.setDepth(500);
+    this.tweens.add({
+      targets: fire,
+      scaleY: { from: 1, to: 1.3 },
+      duration: 400,
+      yoyo: true,
+      repeat: -1,
+    });
+  }
+
+  _showGameMessage(text) {
+    if (this._messageText) this._messageText.destroy();
+    this._messageText = this.add
+      .text(SCREEN_PIXEL_WIDTH / 2, SCREEN_PIXEL_HEIGHT - 16, text, {
+        fontFamily: "ui-monospace, monospace",
+        fontSize: "10px",
+        color: "#ffffff",
+        backgroundColor: "rgba(0,0,0,0.6)",
+        padding: { x: 8, y: 4 },
+      })
+      .setOrigin(0.5, 1)
+      .setScrollFactor(0)
+      .setDepth(10001);
+
+    this.time.delayedCall(2500, () => {
+      if (this._messageText) {
+        this._messageText.destroy();
+        this._messageText = null;
+      }
+    });
+  }
+
+  _initPlayerStats(spawnX, spawnY) {
+    this.spawnX = spawnX;
+    this.spawnY = spawnY;
+    this.energy = START_ENERGY;
+    this.lives = START_LIVES;
+    this._isDead = false;
+    this._invulnerableUntil = 0;
+    this._airbornePeakY = null;
+  }
+
+  _createStatusUI() {
+    if (this.statusUI) this.statusUI.destroy();
+
+    const hudX = 6;
+    const hudY = 6;
+    const barWidth = 64;
+    const barHeight = 6;
+
+    this.statusUI = this.add.container(0, 0);
+    this.statusUI.setScrollFactor(0);
+    this.statusUI.setDepth(9998);
+
+    this._livesText = this.add.text(hudX, hudY, "", {
+      fontFamily: "ui-monospace, monospace",
+      fontSize: "10px",
+      color: "#ffffff",
+    });
+    this._livesText.setOrigin(0, 0);
+
+    const energyLabel = this.add.text(hudX, hudY + 14, "Energy", {
+      fontFamily: "ui-monospace, monospace",
+      fontSize: "8px",
+      color: "#aaaaaa",
+    });
+    energyLabel.setOrigin(0, 0);
+
+    const energyBarBg = this.add.rectangle(hudX, hudY + 26, barWidth, barHeight, 0x2d2d44);
+    energyBarBg.setOrigin(0, 0);
+
+    this._energyBarFill = this.add.rectangle(hudX, hudY + 26, barWidth, barHeight, 0x5fd38d);
+    this._energyBarFill.setOrigin(0, 0);
+
+    this.statusUI.add([this._livesText, energyLabel, energyBarBg, this._energyBarFill]);
+    this._updateStatusUI();
+  }
+
+  _updateStatusUI() {
+    if (!this._livesText || !this._energyBarFill) return;
+
+    this._livesText.setText(`Lives ${this.lives}`);
+
+    const ratio = Phaser.Math.Clamp(this.energy / MAX_ENERGY, 0, 1);
+    const barWidth = 64;
+    this._energyBarFill.width = Math.max(0, barWidth * ratio);
+    this._energyBarFill.setFillStyle(ratio <= 0.25 ? 0xff4444 : 0x5fd38d);
+  }
+
+  /** Positive restores energy; negative drains it. Call from hazards, items, etc. */
+  _changeEnergy(delta) {
+    if (this._isDead) return;
+    if (delta < 0 && this.time.now < this._invulnerableUntil) return;
+
+    this.energy = Phaser.Math.Clamp(this.energy + delta, 0, MAX_ENERGY);
+    this._updateStatusUI();
+
+    if (this.energy <= 0) {
+      this._loseLife();
+    }
+  }
+
+  _loseLife() {
+    if (this._isDead) return;
+
+    this.lives -= 1;
+    this._updateStatusUI();
+
+    if (this.lives <= 0) {
+      this._gameOver();
+      return;
+    }
+
+    this._showGameMessage("Ouch!");
+    this._respawnPlayer();
+  }
+
+  _respawnPlayer() {
+    this.energy = MAX_ENERGY;
+    this._updateStatusUI();
+    this._closeInventory();
+    this._airbornePeakY = null;
+    this._invulnerableUntil = this.time.now + RESPAWN_INVULN_MS;
+
+    this.player.setPosition(this.spawnX, this.spawnY);
+    this.player.body.reset(this.spawnX, this.spawnY);
+    this.player.body.setVelocity(0, 0);
+    this._setActiveRoomForPlayer(true);
+    this._updateRoomCamera();
+  }
+
+  _gameOver() {
+    this._isDead = true;
+    this.energy = 0;
+    this._updateStatusUI();
+    this._closeInventory();
+    this.player.body.setVelocity(0, 0);
+    this._showGameMessage("Game Over");
+  }
+
+  _updateFallDamage(onGround) {
+    if (this._isDead || this.time.now < this._invulnerableUntil) {
+      if (onGround) this._airbornePeakY = null;
+      return;
+    }
+
+    if (!onGround) {
+      if (this._airbornePeakY == null) {
+        this._airbornePeakY = this.player.y;
+      } else {
+        this._airbornePeakY = Math.min(this._airbornePeakY, this.player.y);
+      }
+      return;
+    }
+
+    if (this._airbornePeakY == null) return;
+
+    const fallPx = this.player.y - this._airbornePeakY;
+    this._airbornePeakY = null;
+
+    if (fallPx < FALL_DAMAGE_MIN_PX) return;
+
+    const damage = Math.ceil((fallPx - FALL_DAMAGE_MIN_PX) * FALL_DAMAGE_ENERGY_PER_PX);
+    if (damage > 0) {
+      this._changeEnergy(-damage);
+    }
+  }
+
   _getItemDefinitions() {
     return {
       key: { name: "Key", color: "#FFD700" },
+      matches: { name: "Matches", color: "#8B4513" },
       coin: { name: "Coin", color: "#FFA500" },
       potion: { name: "Potion", color: "#FF00FF" },
       gem: { name: "Gem", color: "#00FFFF" },
@@ -647,7 +1179,7 @@ class MainScene extends Phaser.Scene {
   }
 
   _createWorldItems() {
-    this.worldItems = this.physics.add.group();
+    this.worldItems = this.physics.add.staticGroup();
 
     if (!this._mapEnabled || !this.map) {
       const fallbackItems = [
@@ -676,26 +1208,40 @@ class MainScene extends Phaser.Scene {
     const texKey = `item_${itemType}`;
     if (!this.textures.exists(texKey)) return;
 
-    const item = this.physics.add.sprite(x, y, texKey);
+    const item = this.worldItems.create(x, y, texKey);
     item.setOrigin(0.5, 1);
-    item.body.setAllowGravity(false);
-    item.body.setImmovable(true);
+    item.refreshBody();
     item.setData("itemType", itemType);
-
-    this.worldItems.add(item);
   }
 
-  _checkItemPickup() {
-    if (!this.player || !this.worldItems) return;
+  _pickupNearbyItem() {
+    if (!this.player || !this.worldItems) return false;
+    if (this.inventory.length >= this.inventoryMaxSize) return false;
 
-    this.physics.overlap(this.player, this.worldItems, (player, item) => {
-      if (this.inventory.length < this.inventoryMaxSize) {
-        const itemType = item.getData("itemType");
-        this.inventory.push(itemType);
-        item.destroy();
-        this._updateInventoryUI();
+    const playerBounds = this.player.getBounds();
+    Phaser.Geom.Rectangle.Inflate(playerBounds, ITEM_PICKUP_MARGIN, ITEM_PICKUP_MARGIN);
+
+    let nearestItem = null;
+    let nearestDistance = Number.POSITIVE_INFINITY;
+
+    for (const item of this.worldItems.getChildren()) {
+      if (!item.active || !item.visible) continue;
+      if (!Phaser.Geom.Intersects.RectangleToRectangle(playerBounds, item.getBounds())) continue;
+
+      const distance = Phaser.Math.Distance.Between(this.player.x, this.player.y, item.x, item.y);
+      if (distance < nearestDistance) {
+        nearestItem = item;
+        nearestDistance = distance;
       }
-    });
+    }
+
+    if (!nearestItem) return false;
+
+    const itemType = nearestItem.getData("itemType");
+    this.inventory.push(itemType);
+    nearestItem.destroy();
+    this._updateInventoryUI();
+    return true;
   }
 
   _createInventoryUI() {
@@ -709,7 +1255,7 @@ class MainScene extends Phaser.Scene {
     this.inventoryUI.setVisible(false);
 
     const panelWidth = 200;
-    const panelHeight = 120;
+    const panelHeight = 150;
     const panelX = (SCREEN_PIXEL_WIDTH - panelWidth) / 2;
     const panelY = 20;
 
@@ -727,6 +1273,7 @@ class MainScene extends Phaser.Scene {
     this.inventoryUI.add([bg, title]);
     this.inventoryUI.setData("panelX", panelX);
     this.inventoryUI.setData("panelY", panelY);
+    this.inventoryUI.setData("panelWidth", panelWidth);
     this.inventoryUI.setData("slotSprites", []);
 
     this._updateInventoryUI();
@@ -743,6 +1290,7 @@ class MainScene extends Phaser.Scene {
 
     const panelX = this.inventoryUI.getData("panelX");
     const panelY = this.inventoryUI.getData("panelY");
+    const panelWidth = this.inventoryUI.getData("panelWidth");
     const itemDefs = this._getItemDefinitions();
 
     for (let i = 0; i < this.inventoryMaxSize; i++) {
@@ -779,32 +1327,110 @@ class MainScene extends Phaser.Scene {
       }
     }
 
-    const helpText = this.add.text(panelX + 100, panelY + 105, "I: Toggle | D: Drop Selected", {
+    const closeIndex = this.inventoryMaxSize;
+    const closeButton = this.add.rectangle(panelX + panelWidth / 2, panelY + 124, 72, 22, 0x2d2d44);
+    closeButton.setOrigin(0.5, 0.5);
+    closeButton.setStrokeStyle(this.selectedInventorySlot === closeIndex ? 2 : 1, this.selectedInventorySlot === closeIndex ? 0xffff00 : 0x666666);
+    this.inventoryUI.add(closeButton);
+    slotSprites.push(closeButton);
+
+    const closeText = this.add.text(panelX + panelWidth / 2, panelY + 124, "Close", {
       fontFamily: "ui-monospace, monospace",
-      fontSize: "8px",
-      color: "#aaaaaa",
+      fontSize: "10px",
+      color: "#ffffff",
     });
-    helpText.setOrigin(0.5, 0);
-    this.inventoryUI.add(helpText);
-    slotSprites.push(helpText);
+    closeText.setOrigin(0.5, 0.5);
+    this.inventoryUI.add(closeText);
+    slotSprites.push(closeText);
 
     this.inventoryUI.setData("slotSprites", slotSprites);
   }
 
-  _toggleInventory() {
+  _openInventory({ justPickedUp = false } = {}) {
     if (!this.inventoryUI) return;
-    this.inventoryVisible = !this.inventoryVisible;
-    this.inventoryUI.setVisible(this.inventoryVisible);
-    if (this.inventoryVisible) {
-      this._updateInventoryUI();
+    this.inventoryVisible = true;
+    WORMY_KEYS.left = false;
+    WORMY_KEYS.right = false;
+    WORMY_KEYS.invNavDir = null;
+
+    const closeIndex = this.inventoryMaxSize;
+    if (justPickedUp || this.inventory.length === 0) {
+      this.selectedInventorySlot = closeIndex;
+      this._inventoryReturnSlot = justPickedUp ? Math.max(0, this.inventory.length - 1) : 0;
+    } else {
+      this.selectedInventorySlot = 0;
+      this._inventoryReturnSlot = 0;
     }
+
+    this.inventoryUI.setVisible(true);
+    this._updateInventoryUI();
+  }
+
+  _closeInventory() {
+    if (!this.inventoryUI) return;
+    this.inventoryVisible = false;
+    this.inventoryUI.setVisible(false);
+  }
+
+  _handleInventoryReturn() {
+    if (this.selectedInventorySlot >= this.inventoryMaxSize) {
+      this._closeInventory();
+      return;
+    }
+
+    if (this.selectedInventorySlot >= this.inventory.length) return;
+
+    const itemType = this.inventory[this.selectedInventorySlot];
+    if (this._findNearbyInteraction()) {
+      if (this._tryUseNearbyInteraction(itemType, this.selectedInventorySlot)) {
+        this._closeInventory();
+        return;
+      }
+      this._showGameMessage("That doesn't work here.");
+      return;
+    }
+
+    this._dropSelectedItem();
+    this._closeInventory();
+  }
+
+  _moveInventoryNav(direction) {
+    if (!this.inventoryVisible) return;
+
+    const closeIndex = this.inventoryMaxSize;
+    const itemCount = this.inventory.length;
+
+    if (direction === "down") {
+      if (this.selectedInventorySlot < closeIndex) {
+        this._inventoryReturnSlot = Phaser.Math.Clamp(this.selectedInventorySlot, 0, Math.max(0, itemCount - 1));
+        this.selectedInventorySlot = closeIndex;
+        this._updateInventoryUI();
+      }
+      return;
+    }
+
+    if (direction === "up") {
+      if (this.selectedInventorySlot === closeIndex) {
+        this.selectedInventorySlot = this._inventoryReturnSlot ?? 0;
+        this._updateInventoryUI();
+      }
+      return;
+    }
+
+    if (this.selectedInventorySlot === closeIndex || itemCount === 0) return;
+
+    const maxItemSlot = itemCount - 1;
+    if (direction === "left") {
+      this.selectedInventorySlot = this.selectedInventorySlot <= 0 ? maxItemSlot : this.selectedInventorySlot - 1;
+    } else if (direction === "right") {
+      this.selectedInventorySlot = this.selectedInventorySlot >= maxItemSlot ? 0 : this.selectedInventorySlot + 1;
+    }
+    this._updateInventoryUI();
   }
 
   _dropSelectedItem() {
     if (this.inventory.length === 0) return;
-    if (this.selectedInventorySlot >= this.inventory.length) {
-      this.selectedInventorySlot = 0;
-    }
+    if (this.selectedInventorySlot >= this.inventory.length) return;
 
     const itemType = this.inventory[this.selectedInventorySlot];
     this.inventory.splice(this.selectedInventorySlot, 1);
