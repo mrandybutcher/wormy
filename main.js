@@ -23,6 +23,16 @@ const DEFAULT_SPAWN_TILE = { x: 2, y: 5 };
 // Player sprite size (what you see)
 const PLAYER_WIDTH = 16;
 const PLAYER_HEIGHT = 16;
+/** Player spritesheets: 4×4 grid of frames at native tile size (16×16). */
+const PLAYER_SPRITE_URL = "assets/wormy_spritesheet.png";
+const PLAYER_JUMP_DIAGONAL_URL = "assets/wormy_spritesheet_diagonal_jump.png";
+const PLAYER_JUMP_VERTICAL_URL = "assets/wormy_spritesheet_vertical_jump.png";
+const PLAYER_FRAME_WIDTH = 16;
+const PLAYER_FRAME_HEIGHT = 16;
+const PLAYER_ANIM_FRAME_COUNT = 16;
+const PLAYER_WALK_FRAME_COUNT = 9;
+const PLAYER_WALK_FRAME_RATE = 12;
+const PLAYER_JUMP_FRAME_RATE = 12;
 
 // Player physics hitbox in texture pixels (with native 1:1 texture scale, world size matches tiles).
 const PLAYER_BODY_WIDTH = PLAYER_WIDTH;
@@ -32,7 +42,7 @@ const PLAYER_BODY_OFFSET_Y = 0;
 
 // Classic Dizzy-like feel: constant walk speed (no horizontal accel), strong gravity, modest jump.
 const PHYS_GRAVITY_Y = 440;
-const PHYS_WALK_SPEED_X = 100;
+const PHYS_WALK_SPEED_X = 60;
 const PHYS_MAX_SPEED_Y = 200;
 // Peak jump height ∝ velocity² at fixed gravity — ×2 height ⇒ velocity × √2
 const PHYS_JUMP_VELOCITY = Math.round(360 * Math.SQRT2);
@@ -211,11 +221,14 @@ class MainScene extends Phaser.Scene {
     this.load.image("item_key", "assets/key.png");
     this.load.json("mapJson", TILEMAP_JSON_URL);
     
-    // Load player sprite sheet (2 frames, 16x16 each)
-    this.load.spritesheet("player", "assets/sprite_sheet_sample.png", {
-      frameWidth: 16,
-      frameHeight: 16
-    });
+    // 4×4 worm animations (16×16 per frame; resized from *_large.png sources)
+    const playerSheet = {
+      frameWidth: PLAYER_FRAME_WIDTH,
+      frameHeight: PLAYER_FRAME_HEIGHT,
+    };
+    this.load.spritesheet("player", PLAYER_SPRITE_URL, playerSheet);
+    this.load.spritesheet("player_jump_diagonal", PLAYER_JUMP_DIAGONAL_URL, playerSheet);
+    this.load.spritesheet("player_jump_vertical", PLAYER_JUMP_VERTICAL_URL, playerSheet);
   }
 
   create() {
@@ -422,23 +435,13 @@ class MainScene extends Phaser.Scene {
       }
     }
 
-    const isMoving = !this.inventoryVisible && (WORMY_KEYS.left || WORMY_KEYS.right);
-    if (isMoving) {
-      if (this.player.anims && !this.player.anims.isPlaying) {
-        this.player.play("player_walk", true);
-      }
-    } else {
-      if (this.player.anims) {
-        this.player.stop();
-        this.player.setFrame(0);
-      }
-    }
-
     const onGround = body.blocked.down || body.touching.down;
     if (!this.inventoryVisible && onGround && WORMY_KEYS.jumpQueued) {
       body.setVelocityY(-PHYS_JUMP_VELOCITY);
       WORMY_KEYS.jumpQueued = false;
     }
+
+    this._updatePlayerAnimation(onGround);
 
     this._updateFallDamage(onGround);
 
@@ -546,16 +549,58 @@ class MainScene extends Phaser.Scene {
   }
 
   _createPlayerAnimations() {
-    if (!this.textures.exists("player")) return;
-    if (this.anims.exists("player_walk")) return;
-    
-    // Create walking animation using both frames
-    this.anims.create({
-      key: "player_walk",
-      frames: this.anims.generateFrameNumbers("player", { start: 0, end: 1 }),
-      frameRate: 8,
-      repeat: -1
-    });
+    const animSpecs = [
+      { texture: "player", key: "player_walk", frameRate: PLAYER_WALK_FRAME_RATE, end: PLAYER_WALK_FRAME_COUNT - 1 },
+      { texture: "player_jump_diagonal", key: "player_jump_diagonal", frameRate: PLAYER_JUMP_FRAME_RATE, end: PLAYER_ANIM_FRAME_COUNT - 1 },
+      { texture: "player_jump_vertical", key: "player_jump_vertical", frameRate: PLAYER_JUMP_FRAME_RATE, end: PLAYER_ANIM_FRAME_COUNT - 1 },
+    ];
+
+    for (const { texture, key, frameRate, end } of animSpecs) {
+      if (!this.textures.exists(texture) || this.anims.exists(key)) continue;
+      this.anims.create({
+        key,
+        frames: this.anims.generateFrameNumbers(texture, { start: 0, end }),
+        frameRate,
+        repeat: -1,
+      });
+    }
+  }
+
+  _updatePlayerAnimation(onGround) {
+    if (!this.player || this.inventoryVisible) return;
+
+    const body = this.player.body;
+    const isMoving = WORMY_KEYS.left || WORMY_KEYS.right;
+
+    if (!onGround) {
+      const diagonal =
+        Math.abs(body.velocity.x) > 20 ||
+        isMoving ||
+        (body.velocity.y < 0 && (WORMY_KEYS.left || WORMY_KEYS.right));
+      const textureKey = diagonal ? "player_jump_diagonal" : "player_jump_vertical";
+      const animKey = textureKey;
+
+      if (this.player.texture.key !== textureKey) {
+        this.player.setTexture(textureKey);
+      }
+      if (!this.player.anims.isPlaying || this.player.anims.currentAnim?.key !== animKey) {
+        this.player.play(animKey, true);
+      }
+      return;
+    }
+
+    if (this.player.texture.key !== "player") {
+      this.player.setTexture("player");
+    }
+
+    if (isMoving) {
+      if (!this.player.anims.isPlaying || this.player.anims.currentAnim?.key !== "player_walk") {
+        this.player.play("player_walk", true);
+      }
+    } else if (this.player.anims) {
+      this.player.anims.stop();
+      this.player.setFrame(0);
+    }
   }
 
   _normalizeTiledTilesets(mapJson) {
