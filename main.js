@@ -58,6 +58,24 @@ const VIEW_ZOOM = 1;
 const GAME_WIDTH = SCREEN_PIXEL_WIDTH * VIEW_ZOOM;
 const GAME_HEIGHT = SCREEN_PIXEL_HEIGHT * VIEW_ZOOM;
 const ITEM_PICKUP_MARGIN = 12;
+const DEPTH_WORLD_ITEMS = 5;
+const DEPTH_PLAYER = 10;
+/**
+ * World/inventory item types. Set `image` for sprite art; omit `image` and set `color` for a placeholder tile.
+ * In Tiled, place point objects on the Items layer with property itemType matching the key below.
+ */
+const ITEM_DEFINITIONS = {
+  key: { name: "Key", image: "assets/item_key.png" },
+  berry: { name: "Berry", image: "assets/item_berry.png" },
+  button: { name: "Button", image: "assets/item_button.png" },
+  grass: { name: "Grass", image: "assets/item_grass.png" },
+  leaf: { name: "Leaf", image: "assets/item_leaf.png" },
+  matches: { name: "Matches", color: "#8B4513" },
+  coin: { name: "Coin", color: "#FFA500" },
+  potion: { name: "Potion", color: "#FF00FF" },
+  gem: { name: "Gem", color: "#00FFFF" },
+  apple: { name: "Apple", color: "#FF0000" },
+};
 const INTERACTIONS_LAYER_NAME = "Interactions";
 const INTERACTION_USE_MARGIN = 12;
 
@@ -218,7 +236,9 @@ class MainScene extends Phaser.Scene {
 
   preload() {
     this.load.image("tiles", TILESET_IMAGE_URL);
-    this.load.image("item_key", "assets/key.png");
+    for (const [itemId, def] of Object.entries(ITEM_DEFINITIONS)) {
+      if (def.image) this.load.image(`item_${itemId}`, def.image);
+    }
     this.load.json("mapJson", TILEMAP_JSON_URL);
     
     // 4×4 worm animations (16×16 per frame; resized from *_large.png sources)
@@ -691,6 +711,7 @@ class MainScene extends Phaser.Scene {
     // Do NOT use setSize(..., true): that centers the hitbox on (x, y), which with bottom-center origin
     // places half the body below the feet.
     player.setOrigin(0.5, 1);
+    player.setDepth(DEPTH_PLAYER);
     const body = player.body;
     body.setSize(PLAYER_BODY_WIDTH, PLAYER_BODY_HEIGHT, false);
     body.setOffset(PLAYER_BODY_OFFSET_X, PLAYER_BODY_OFFSET_Y);
@@ -1245,14 +1266,7 @@ class MainScene extends Phaser.Scene {
   }
 
   _getItemDefinitions() {
-    return {
-      key: { name: "Key", color: "#FFD700" },
-      matches: { name: "Matches", color: "#8B4513" },
-      coin: { name: "Coin", color: "#FFA500" },
-      potion: { name: "Potion", color: "#FF00FF" },
-      gem: { name: "Gem", color: "#00FFFF" },
-      apple: { name: "Apple", color: "#FF0000" },
-    };
+    return ITEM_DEFINITIONS;
   }
 
   _createWorldItems() {
@@ -1287,6 +1301,7 @@ class MainScene extends Phaser.Scene {
 
     const item = this.worldItems.create(x, y, texKey);
     item.setOrigin(0.5, 1);
+    item.setDepth(DEPTH_WORLD_ITEMS);
     item.refreshBody();
     item.setData("itemType", itemType);
   }
