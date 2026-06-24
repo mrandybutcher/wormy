@@ -10,9 +10,34 @@ const TILEMAP_JSON_URL = "Maps/wholemap.json"; // export your growing Tiled worl
 // If your map JSON has an embedded tileset (tilesets[0].name + tilesets[0].image),
 // the easiest path is to copy that image into your project and set TILESET_IMAGE_URL to it.
 const TILESET_IMAGE_URL = "Tilesets/spelunky_shop.png";
-
-// Optional fallback if you later reintroduce TSX-based tilesets:
-// const TILESET_TSX_URL = "Tilesets/spelunky_shop.tsx";
+const WORMY_TILESET_IMAGE_URL = "Tilesets/wormy_tiles.png";
+/** Defaults for external .tsx tilesets referenced in map JSON (no embedded copy in export). */
+const TILESET_SPECS = {
+  spelunky_shop: {
+    textureKey: "tiles",
+    image: TILESET_IMAGE_URL,
+    columns: 4,
+    tilewidth: 16,
+    tileheight: 16,
+    tilecount: 20,
+    imagewidth: 64,
+    imageheight: 80,
+    margin: 0,
+    spacing: 0,
+  },
+  wormy_tiles: {
+    textureKey: "wormy_tiles",
+    image: WORMY_TILESET_IMAGE_URL,
+    columns: 6,
+    tilewidth: 16,
+    tileheight: 16,
+    tilecount: 6,
+    imagewidth: 96,
+    imageheight: 16,
+    margin: 0,
+    spacing: 0,
+  },
+};
 const COLLISION_LAYER_NAME = "Collisions"; // alternatively use layer property: collides=true
 
 // Used only when the map has no object named "Spawn" on layer "Objects".
@@ -60,13 +85,17 @@ const GAME_HEIGHT = SCREEN_PIXEL_HEIGHT * VIEW_ZOOM;
 const ITEM_PICKUP_MARGIN = 12;
 const DEPTH_WORLD_ITEMS = 5;
 const DEPTH_PLAYER = 10;
+const MAX_ENERGY = 50;
+const BERRY_ENERGY_RESTORE = 20;
+const ENERGY_BAR_WIDTH = 64;
+const ENERGY_BAR_ANIM_MS = 350;
 /**
  * World/inventory item types. Set `image` for sprite art; omit `image` and set `color` for a placeholder tile.
  * In Tiled, place point objects on the Items layer with property itemType matching the key below.
  */
 const ITEM_DEFINITIONS = {
   key: { name: "Key", image: "assets/item_key.png" },
-  berry: { name: "Berry", image: "assets/item_berry.png" },
+  berry: { name: "Berry", image: "assets/item_berry.png", energyOnPickup: BERRY_ENERGY_RESTORE, consumeOnPickup: true },
   button: { name: "Button", image: "assets/item_button.png" },
   grass: { name: "Grass", image: "assets/item_grass.png" },
   leaf: { name: "Leaf", image: "assets/item_leaf.png" },
@@ -79,7 +108,6 @@ const ITEM_DEFINITIONS = {
 const INTERACTIONS_LAYER_NAME = "Interactions";
 const INTERACTION_USE_MARGIN = 12;
 
-const MAX_ENERGY = 50;
 const START_ENERGY = MAX_ENERGY;
 const START_LIVES = 3;
 const RESPAWN_INVULN_MS = 2000;
@@ -236,6 +264,7 @@ class MainScene extends Phaser.Scene {
 
   preload() {
     this.load.image("tiles", TILESET_IMAGE_URL);
+    this.load.image("wormy_tiles", WORMY_TILESET_IMAGE_URL);
     for (const [itemId, def] of Object.entries(ITEM_DEFINITIONS)) {
       if (def.image) this.load.image(`item_${itemId}`, def.image);
     }
@@ -277,17 +306,18 @@ class MainScene extends Phaser.Scene {
     this.map = this.make.tilemap({ key: "map" });
 
     const tilesetInstances = this.map.tilesets
-      .map((ts) =>
-        this.map.addTilesetImage(
+      .map((ts) => {
+        const spec = TILESET_SPECS[this._tilesetBaseName(ts.name)] || TILESET_SPECS.spelunky_shop;
+        return this.map.addTilesetImage(
           ts.name,
-          "tiles",
+          spec.textureKey,
           ts.tileWidth ?? this.map.tileWidth,
           ts.tileHeight ?? this.map.tileHeight,
           ts.margin ?? 0,
           ts.spacing ?? 0,
           ts.firstgid ?? 1,
-        ),
-      )
+        );
+      })
       .filter(Boolean);
     if (tilesetInstances.length === 0) {
       this._createFallbackWorld(
@@ -420,10 +450,13 @@ class MainScene extends Phaser.Scene {
       try {
         if (this.inventoryVisible) {
           this._handleInventoryReturn();
-        } else if (this._pickupNearbyItem()) {
-          this._openInventory({ justPickedUp: true });
         } else {
-          this._openInventory();
+          const pickupResult = this._pickupNearbyItem();
+          if (pickupResult === "inventory") {
+            this._openInventory({ justPickedUp: true });
+          } else if (pickupResult === false) {
+            this._openInventory();
+          }
         }
       } finally {
         WORMY_KEYS.enterQueued = false;
@@ -629,33 +662,29 @@ class MainScene extends Phaser.Scene {
 
     const usedNames = new Set(normalized.tilesets.filter((ts) => ts.name).map((ts) => ts.name));
     const embeddedTilesets = normalized.tilesets.filter((ts) => !ts.source);
-    const textureSource = this.textures.get("tiles").getSourceImage();
 
     normalized.tilesets = normalized.tilesets.map((tileset) => {
       if (!tileset.source) return tileset;
 
       const sourceName = this._filenameWithoutExtension(tileset.source);
-      const template = embeddedTilesets.find((ts) => ts.name === sourceName) || embeddedTilesets[0] || {};
+      const spec = TILESET_SPECS[sourceName] || {};
+      const template =
+        embeddedTilesets.find((ts) => ts.name === sourceName) || embeddedTilesets[0] || spec;
       const name = this._uniqueTilesetName(sourceName || "tileset", usedNames, tileset.firstgid);
       usedNames.add(name);
 
-      const tileWidth = template.tilewidth ?? normalized.tilewidth;
-      const tileHeight = template.tileheight ?? normalized.tileheight;
-      const columns = template.columns ?? Math.max(1, Math.floor(textureSource.width / tileWidth));
-      const rows = Math.max(1, Math.floor(textureSource.height / tileHeight));
-
       return {
-        columns,
+        columns: template.columns ?? spec.columns ?? 1,
         firstgid: tileset.firstgid,
-        image: template.image ?? TILESET_IMAGE_URL,
-        imageheight: template.imageheight ?? textureSource.height,
-        imagewidth: template.imagewidth ?? textureSource.width,
-        margin: template.margin ?? 0,
+        image: template.image ?? spec.image ?? TILESET_IMAGE_URL,
+        imageheight: template.imageheight ?? spec.imageheight,
+        imagewidth: template.imagewidth ?? spec.imagewidth,
+        margin: template.margin ?? spec.margin ?? 0,
         name,
-        spacing: template.spacing ?? 0,
-        tilecount: template.tilecount ?? columns * rows,
-        tileheight: tileHeight,
-        tilewidth: tileWidth,
+        spacing: template.spacing ?? spec.spacing ?? 0,
+        tilecount: template.tilecount ?? spec.tilecount,
+        tileheight: template.tileheight ?? spec.tileheight ?? normalized.tileheight,
+        tilewidth: template.tilewidth ?? spec.tilewidth ?? normalized.tilewidth,
       };
     });
 
@@ -677,6 +706,12 @@ class MainScene extends Phaser.Scene {
   _filenameWithoutExtension(path) {
     const filename = path.split(/[\\/]/).pop() || "";
     return filename.replace(/\.[^.]+$/, "");
+  }
+
+  _tilesetBaseName(tilesetName) {
+    if (tilesetName.startsWith("wormy_tiles")) return "wormy_tiles";
+    if (tilesetName.startsWith("spelunky_shop")) return "spelunky_shop";
+    return tilesetName.replace(/_\d+$/, "");
   }
 
   _uniqueTilesetName(baseName, usedNames, firstgid) {
@@ -1144,7 +1179,6 @@ class MainScene extends Phaser.Scene {
 
     const hudX = 6;
     const hudY = 6;
-    const barWidth = 64;
     const barHeight = 6;
 
     this.statusUI = this.add.container(0, 0);
@@ -1165,25 +1199,51 @@ class MainScene extends Phaser.Scene {
     });
     energyLabel.setOrigin(0, 0);
 
-    const energyBarBg = this.add.rectangle(hudX, hudY + 26, barWidth, barHeight, 0x2d2d44);
+    const energyBarBg = this.add.rectangle(hudX, hudY + 26, ENERGY_BAR_WIDTH, barHeight, 0x2d2d44);
     energyBarBg.setOrigin(0, 0);
 
-    this._energyBarFill = this.add.rectangle(hudX, hudY + 26, barWidth, barHeight, 0x5fd38d);
+    this._energyBarFill = this.add.rectangle(hudX, hudY + 26, ENERGY_BAR_WIDTH, barHeight, 0x5fd38d);
     this._energyBarFill.setOrigin(0, 0);
 
     this.statusUI.add([this._livesText, energyLabel, energyBarBg, this._energyBarFill]);
     this._updateStatusUI();
   }
 
-  _updateStatusUI() {
+  _energyBarColor(ratio) {
+    return ratio <= 0.25 ? 0xff4444 : 0x5fd38d;
+  }
+
+  _updateStatusUI({ animateEnergy = false } = {}) {
     if (!this._livesText || !this._energyBarFill) return;
 
     this._livesText.setText(`Lives ${this.lives}`);
 
     const ratio = Phaser.Math.Clamp(this.energy / MAX_ENERGY, 0, 1);
-    const barWidth = 64;
-    this._energyBarFill.width = Math.max(0, barWidth * ratio);
-    this._energyBarFill.setFillStyle(ratio <= 0.25 ? 0xff4444 : 0x5fd38d);
+    const targetWidth = Math.max(0, ENERGY_BAR_WIDTH * ratio);
+    const targetColor = this._energyBarColor(ratio);
+
+    if (animateEnergy && Math.abs(this._energyBarFill.width - targetWidth) > 0.5) {
+      this.tweens.killTweensOf(this._energyBarFill);
+      this.tweens.add({
+        targets: this._energyBarFill,
+        width: targetWidth,
+        duration: ENERGY_BAR_ANIM_MS,
+        ease: "Cubic.easeOut",
+        onUpdate: () => {
+          const currentRatio = this._energyBarFill.width / ENERGY_BAR_WIDTH;
+          this._energyBarFill.setFillStyle(this._energyBarColor(currentRatio));
+        },
+        onComplete: () => {
+          this._energyBarFill.width = targetWidth;
+          this._energyBarFill.setFillStyle(targetColor);
+        },
+      });
+      return;
+    }
+
+    this.tweens.killTweensOf(this._energyBarFill);
+    this._energyBarFill.width = targetWidth;
+    this._energyBarFill.setFillStyle(targetColor);
   }
 
   /** Positive restores energy; negative drains it. Call from hazards, items, etc. */
@@ -1192,7 +1252,7 @@ class MainScene extends Phaser.Scene {
     if (delta < 0 && this.time.now < this._invulnerableUntil) return;
 
     this.energy = Phaser.Math.Clamp(this.energy + delta, 0, MAX_ENERGY);
-    this._updateStatusUI();
+    this._updateStatusUI({ animateEnergy: true });
 
     if (this.energy <= 0) {
       this._loseLife();
@@ -1216,7 +1276,7 @@ class MainScene extends Phaser.Scene {
 
   _respawnPlayer() {
     this.energy = MAX_ENERGY;
-    this._updateStatusUI();
+    this._updateStatusUI({ animateEnergy: true });
     this._closeInventory();
     this._airbornePeakY = null;
     this._invulnerableUntil = this.time.now + RESPAWN_INVULN_MS;
@@ -1231,7 +1291,7 @@ class MainScene extends Phaser.Scene {
   _gameOver() {
     this._isDead = true;
     this.energy = 0;
-    this._updateStatusUI();
+    this._updateStatusUI({ animateEnergy: true });
     this._closeInventory();
     this.player.body.setVelocity(0, 0);
     this._showGameMessage("Game Over");
@@ -1308,7 +1368,6 @@ class MainScene extends Phaser.Scene {
 
   _pickupNearbyItem() {
     if (!this.player || !this.worldItems) return false;
-    if (this.inventory.length >= this.inventoryMaxSize) return false;
 
     const playerBounds = this.player.getBounds();
     Phaser.Geom.Rectangle.Inflate(playerBounds, ITEM_PICKUP_MARGIN, ITEM_PICKUP_MARGIN);
@@ -1330,10 +1389,23 @@ class MainScene extends Phaser.Scene {
     if (!nearestItem) return false;
 
     const itemType = nearestItem.getData("itemType");
+    const itemDef = ITEM_DEFINITIONS[itemType];
+
+    if (itemDef?.consumeOnPickup) {
+      nearestItem.destroy();
+      if (itemDef.energyOnPickup) {
+        this._changeEnergy(itemDef.energyOnPickup);
+        this._showGameMessage(`+${itemDef.energyOnPickup} energy`);
+      }
+      return "consumed";
+    }
+
+    if (this.inventory.length >= this.inventoryMaxSize) return false;
+
     this.inventory.push(itemType);
     nearestItem.destroy();
     this._updateInventoryUI();
-    return true;
+    return "inventory";
   }
 
   _createInventoryUI() {
@@ -1527,9 +1599,7 @@ class MainScene extends Phaser.Scene {
     const itemType = this.inventory[this.selectedInventorySlot];
     this.inventory.splice(this.selectedInventorySlot, 1);
 
-    const dropX = this.player.x + (this.player.flipX ? -20 : 20);
-    const dropY = this.player.y;
-    this._createWorldItem(dropX, dropY, itemType);
+    this._createWorldItem(this.player.x, this.player.y, itemType);
 
     if (this.selectedInventorySlot >= this.inventory.length && this.selectedInventorySlot > 0) {
       this.selectedInventorySlot--;
