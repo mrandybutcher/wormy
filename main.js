@@ -67,6 +67,11 @@ const COLLISION_LAYER_NAME = "Collisions"; // alternatively use layer property: 
 const HAZARDS_LAYER_NAME = "Hazards";
 /** Energy lost per second while the player overlaps a Hazards tile. */
 const WATER_ENERGY_DRAIN_PER_SEC = 10;
+const WATER_BUBBLE_TEXTURE = "water_bubble";
+const WATER_BUBBLE_SPAWN_INTERVAL_MS = 150;
+const WATER_BUBBLE_LIFETIME_MS = 1400;
+const WATER_BUBBLE_RISE_SPEED_MIN = 8;
+const WATER_BUBBLE_RISE_SPEED_MAX = 14;
 
 // Used only when the map has no object named "Spawn" on layer "Objects".
 // Tile column / row in 0-based indices — same numbers Tiled shows when you hover a tile (not 1-based).
@@ -80,6 +85,9 @@ const PLAYER_HEIGHT = 16;
 const PLAYER_SPRITE_URL = "assets/wormy_spritesheet.png";
 const PLAYER_JUMP_DIAGONAL_URL = "assets/wormy_spritesheet_diagonal_jump.png";
 const PLAYER_JUMP_VERTICAL_URL = "assets/wormy_spritesheet_vertical_jump.png";
+/** Single 16×16 frame shown when Wormy dies (replace `assets/wormy_dead.png`). */
+const PLAYER_DEAD_IMAGE_URL = "assets/wormy_dead.png";
+const PLAYER_DEAD_TEXTURE = "player_dead";
 const PLAYER_FRAME_WIDTH = 16;
 const PLAYER_FRAME_HEIGHT = 16;
 const PLAYER_ANIM_FRAME_COUNT = 16;
@@ -113,6 +121,7 @@ const GAME_HEIGHT = SCREEN_PIXEL_HEIGHT * VIEW_ZOOM;
 const ITEM_PICKUP_MARGIN = 12;
 const DEPTH_WORLD_ITEMS = 5;
 const DEPTH_PLAYER = 10;
+const DEPTH_WATER_BUBBLES = DEPTH_PLAYER + 1;
 const MAX_ENERGY = 50;
 const BERRY_ENERGY_RESTORE = 20;
 const ENERGY_BAR_WIDTH = 64;
@@ -141,6 +150,8 @@ const START_ENERGY = MAX_ENERGY;
 const START_LIVES = 3;
 const LIVES_ICON_SIZE = 12;
 const LIVES_ICON_GAP = 2;
+/** Single 12×12 face for the lives HUD (replace `assets/life_worm_face.png`). */
+const LIVES_ICON_IMAGE_URL = "assets/life_worm_face.png";
 const LIVES_ICON_TEXTURE = "life_worm_face";
 /** Matches the orange worm sprite (`assets/wormy_spritesheet.png`). */
 const WORM_BODY_COLOR = "#ff7520";
@@ -287,6 +298,8 @@ class MainScene extends Phaser.Scene {
     this._waterTileGids = null;
     this._hazardsLayer = null;
     this._waterDrainDebt = 0;
+    this._waterBubbles = [];
+    this._waterBubbleSpawnTimer = 0;
     this.selectedInventorySlot = 0;
     this._inventoryReturnSlot = 0;
     this.spawnX = 0;
@@ -299,12 +312,16 @@ class MainScene extends Phaser.Scene {
     this._isDead = false;
     this._invulnerableUntil = 0;
     this._airbornePeakY = null;
+    this._pendingRespawn = false;
+    this._playerLooksDead = false;
   }
 
   preload() {
     this.load.image("tiles", TILESET_IMAGE_URL);
     this.load.image("wormy_tiles", WORMY_TILESET_IMAGE_URL);
     this.load.image("water", WATER_TILESET_IMAGE_URL);
+    this.load.image(LIVES_ICON_TEXTURE, LIVES_ICON_IMAGE_URL);
+    this.load.image(PLAYER_DEAD_TEXTURE, PLAYER_DEAD_IMAGE_URL);
     for (const [itemId, def] of Object.entries(ITEM_DEFINITIONS)) {
       if (def.image) this.load.image(`item_${itemId}`, def.image);
     }
@@ -323,7 +340,14 @@ class MainScene extends Phaser.Scene {
   create() {
     this._ensurePlayerTexture();
     this._createItemTextures();
-    this._createLifeIconTexture();
+    this._createWaterBubbleTexture();
+    if (this.textures.exists(LIVES_ICON_TEXTURE)) {
+      this.textures.get(LIVES_ICON_TEXTURE).setFilter(Phaser.Textures.FilterMode.NEAREST);
+    }
+    if (this.textures.exists(PLAYER_DEAD_TEXTURE)) {
+      this.textures.get(PLAYER_DEAD_TEXTURE).setFilter(Phaser.Textures.FilterMode.NEAREST);
+    }
+
     this._createPlayerAnimations();
 
     this.events.on(Phaser.Scenes.Events.POST_UPDATE, this._snapPlayerToPixels, this);
@@ -484,7 +508,7 @@ class MainScene extends Phaser.Scene {
 
   /** Keep the player on whole pixels (and tile rows when grounded) to avoid blur/flicker. */
   _snapPlayerToPixels() {
-    if (!this.player?.body || this._isDead) return;
+    if (!this.player?.body || this._isDead || this._playerLooksDead) return;
 
     const body = this.player.body;
     const onGround = body.blocked.down || body.touching.down;
@@ -501,12 +525,29 @@ class MainScene extends Phaser.Scene {
 
   update(time, delta) {
     this._updateAnimatedMapTiles(delta);
+    this._updateWaterBubbles(delta);
 
     if (!this.player) return;
     const body = this.player.body;
 
     if (this._isDead) {
       body.setVelocity(0, 0);
+      if (this._messageBox && WORMY_KEYS.enterQueued) {
+        this._dismissGameMessage();
+        WORMY_KEYS.enterQueued = false;
+      }
+      return;
+    }
+
+    if (this._messageBox) {
+      body.setVelocity(0, 0);
+      if (WORMY_KEYS.enterQueued) {
+        this._dismissGameMessage();
+        WORMY_KEYS.enterQueued = false;
+      }
+      WORMY_KEYS.jumpQueued = false;
+      WORMY_KEYS.escQueued = false;
+      if (WORMY_KEYS.invNavDir) WORMY_KEYS.invNavDir = null;
       return;
     }
 
@@ -688,7 +729,7 @@ class MainScene extends Phaser.Scene {
   }
 
   _updatePlayerAnimation(onGround) {
-    if (!this.player || this.inventoryVisible) return;
+    if (!this.player || this.inventoryVisible || this._playerLooksDead) return;
 
     const body = this.player.body;
     const isMoving = WORMY_KEYS.left || WORMY_KEYS.right;
@@ -903,7 +944,18 @@ class MainScene extends Phaser.Scene {
 
     if (!this._isPlayerInWater()) {
       this._waterDrainDebt = 0;
+      this._waterBubbleSpawnTimer = 0;
       return;
+    }
+
+    this._waterBubbleSpawnTimer += delta;
+    while (this._waterBubbleSpawnTimer >= WATER_BUBBLE_SPAWN_INTERVAL_MS) {
+      this._waterBubbleSpawnTimer -= WATER_BUBBLE_SPAWN_INTERVAL_MS;
+      const mouth = this._getPlayerMouthPosition();
+      this._spawnWaterBubble(mouth.x, mouth.y);
+      if (Math.random() < 0.4) {
+        this._spawnWaterBubble(mouth.x + Phaser.Math.Between(-1, 1), mouth.y + 1);
+      }
     }
 
     this._waterDrainDebt += (WATER_ENERGY_DRAIN_PER_SEC * delta) / 1000;
@@ -912,6 +964,75 @@ class MainScene extends Phaser.Scene {
     const drain = Math.floor(this._waterDrainDebt);
     this._waterDrainDebt -= drain;
     this._changeEnergy(-drain);
+  }
+
+  _createWaterBubbleTexture() {
+    if (this.textures.exists(WATER_BUBBLE_TEXTURE)) return;
+
+    const tex = this.textures.createCanvas(WATER_BUBBLE_TEXTURE, 1, 1);
+    tex.context.fillStyle = "#e8f8ff";
+    tex.context.fillRect(0, 0, 1, 1);
+    tex.refresh();
+  }
+
+  _getPlayerMouthPosition() {
+    const mouthY = this.player.y - Math.round(PLAYER_HEIGHT * 0.55);
+    if (this.player.flipX) {
+      return {
+        x: this.player.x - PLAYER_WIDTH / 2 + 1,
+        y: mouthY,
+      };
+    }
+    return {
+      x: this.player.x + PLAYER_WIDTH / 2 - 1,
+      y: mouthY,
+    };
+  }
+
+  _spawnWaterBubble(x, y) {
+    const bubble = this.add.image(Math.round(x), Math.round(y), WATER_BUBBLE_TEXTURE);
+    bubble.setDepth(DEPTH_WATER_BUBBLES);
+    bubble.setAlpha(0.7 + Math.random() * 0.3);
+
+    this._waterBubbles.push({
+      sprite: bubble,
+      x,
+      y,
+      vx: Phaser.Math.FloatBetween(-2.5, 2.5),
+      vy: -Phaser.Math.FloatBetween(WATER_BUBBLE_RISE_SPEED_MIN, WATER_BUBBLE_RISE_SPEED_MAX),
+      life: WATER_BUBBLE_LIFETIME_MS,
+    });
+  }
+
+  _updateWaterBubbles(delta) {
+    if (!this._waterBubbles?.length) return;
+
+    const dt = delta / 1000;
+    for (let i = this._waterBubbles.length - 1; i >= 0; i--) {
+      const entry = this._waterBubbles[i];
+      entry.life -= delta;
+      if (entry.life <= 0) {
+        entry.sprite.destroy();
+        this._waterBubbles.splice(i, 1);
+        continue;
+      }
+
+      entry.x += entry.vx * dt;
+      entry.y += entry.vy * dt;
+      entry.sprite.setPosition(Math.round(entry.x), Math.round(entry.y));
+
+      if (entry.life < 400) {
+        entry.sprite.setAlpha((entry.life / 400) * 0.85);
+      }
+    }
+  }
+
+  _clearWaterBubbles() {
+    if (!this._waterBubbles?.length) return;
+
+    for (const entry of this._waterBubbles) entry.sprite.destroy();
+    this._waterBubbles = [];
+    this._waterBubbleSpawnTimer = 0;
   }
 
   _filenameWithoutExtension(path) {
@@ -1121,39 +1242,25 @@ class MainScene extends Phaser.Scene {
     }
   }
 
-  _createLifeIconTexture() {
-    if (this.textures.exists(LIVES_ICON_TEXTURE)) {
-      this.textures.remove(LIVES_ICON_TEXTURE);
-    }
+  _setPlayerDeadPose() {
+    if (!this.player || !this.textures.exists(PLAYER_DEAD_TEXTURE)) return;
 
-    const size = LIVES_ICON_SIZE;
-    const tex = this.textures.createCanvas(LIVES_ICON_TEXTURE, size, size);
-    const ctx = tex.context;
-    ctx.clearRect(0, 0, size, size);
+    this.player.anims?.stop();
+    this.player.setTexture(PLAYER_DEAD_TEXTURE);
+    this.player.clearTint();
+    this.player.setAngle(0);
+    this._playerLooksDead = true;
+  }
 
-    // Pixel-art face (O = body, E = eye) — avoids anti-aliased arcs looking different per icon.
-    const face = [
-      "0011111100",
-      "0111111110",
-      "1111111111",
-      "1111111111",
-      "1111E11E11",
-      "1111111111",
-      "0111111110",
-      "0011111100",
-    ];
+  _restorePlayerAlivePose() {
+    if (!this.player) return;
 
-    for (let row = 0; row < face.length; row++) {
-      for (let col = 0; col < face[row].length; col++) {
-        const cell = face[row][col];
-        if (cell === "0") continue;
-        ctx.fillStyle = cell === "E" ? "#000000" : WORM_BODY_COLOR;
-        ctx.fillRect(col + 1, row + 2, 1, 1);
-      }
-    }
-
-    tex.setFilter(Phaser.Textures.FilterMode.NEAREST);
-    tex.refresh();
+    this.player.setTexture("player");
+    this.player.setFrame(0);
+    this.player.anims?.stop();
+    this.player.clearTint();
+    this.player.setAngle(0);
+    this._playerLooksDead = false;
   }
 
   _getTiledProperty(obj, name, defaultValue) {
@@ -1420,13 +1527,18 @@ class MainScene extends Phaser.Scene {
     messageText.setOrigin(0.5, 0.5);
 
     this._messageBox.add([outerBorder, innerBg, innerBorder, messageText]);
+  }
 
-    this.time.delayedCall(2500, () => {
-      if (this._messageBox) {
-        this._messageBox.destroy();
-        this._messageBox = null;
-      }
-    });
+  _dismissGameMessage() {
+    if (this._messageBox) {
+      this._messageBox.destroy();
+      this._messageBox = null;
+    }
+
+    if (this._pendingRespawn) {
+      this._pendingRespawn = false;
+      this._respawnPlayer();
+    }
   }
 
   _initPlayerStats(spawnX, spawnY) {
@@ -1437,6 +1549,8 @@ class MainScene extends Phaser.Scene {
     this._isDead = false;
     this._invulnerableUntil = 0;
     this._airbornePeakY = null;
+    this._pendingRespawn = false;
+    this._playerLooksDead = false;
   }
 
   _createStatusUI() {
@@ -1456,6 +1570,7 @@ class MainScene extends Phaser.Scene {
       const iconY = Math.round(hudY + LIVES_ICON_SIZE / 2);
       const icon = this.add.image(iconX, iconY, LIVES_ICON_TEXTURE);
       icon.setOrigin(0.5, 0.5);
+      icon.setDisplaySize(LIVES_ICON_SIZE, LIVES_ICON_SIZE);
       this._lifeIcons.push(icon);
     }
 
@@ -1543,11 +1658,15 @@ class MainScene extends Phaser.Scene {
       return;
     }
 
+    this.player.body.setVelocity(0, 0);
+    this._setPlayerDeadPose();
     this._showGameMessage("You lose a life!");
-    this._respawnPlayer();
+    this._pendingRespawn = true;
   }
 
   _respawnPlayer() {
+    this._clearWaterBubbles();
+    this._restorePlayerAlivePose();
     this.energy = MAX_ENERGY;
     this._updateStatusUI({ animateEnergy: true });
     this._closeInventory();
@@ -1562,11 +1681,13 @@ class MainScene extends Phaser.Scene {
   }
 
   _gameOver() {
+    this._clearWaterBubbles();
     this._isDead = true;
     this.energy = 0;
     this._updateStatusUI({ animateEnergy: true });
     this._closeInventory();
     this.player.body.setVelocity(0, 0);
+    this._setPlayerDeadPose();
     this._showGameMessage("Game Over");
   }
 
