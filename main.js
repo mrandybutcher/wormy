@@ -1143,23 +1143,41 @@ class MainScene extends Phaser.Scene {
   }
 
   _showGameMessage(text) {
-    if (this._messageText) this._messageText.destroy();
-    this._messageText = this.add
-      .text(SCREEN_PIXEL_WIDTH / 2, SCREEN_PIXEL_HEIGHT - 16, text, {
-        fontFamily: "ui-monospace, monospace",
-        fontSize: "10px",
-        color: "#ffffff",
-        backgroundColor: "rgba(0,0,0,0.6)",
-        padding: { x: 8, y: 4 },
-      })
-      .setOrigin(0.5, 1)
-      .setScrollFactor(0)
-      .setDepth(10001);
+    if (this._messageBox) this._messageBox.destroy();
+
+    const boxWidth = 240;
+    const boxHeight = 60;
+    const boxX = SCREEN_PIXEL_WIDTH / 2;
+    const boxY = SCREEN_PIXEL_HEIGHT / 2;
+    const borderWidth = 3;
+
+    this._messageBox = this.add.container(0, 0);
+    this._messageBox.setScrollFactor(0);
+    this._messageBox.setDepth(10001);
+
+    const outerBorder = this.add.rectangle(boxX, boxY, boxWidth, boxHeight, 0x000000);
+    outerBorder.setStrokeStyle(borderWidth, 0xffffff);
+    
+    const innerBg = this.add.rectangle(boxX, boxY, boxWidth - borderWidth * 2, boxHeight - borderWidth * 2, 0x0066cc);
+    
+    const innerBorder = this.add.rectangle(boxX, boxY, boxWidth - borderWidth * 4, boxHeight - borderWidth * 4, 0x0066cc);
+    innerBorder.setStrokeStyle(1, 0xffffff);
+
+    const messageText = this.add.text(boxX, boxY, text, {
+      fontFamily: "ui-monospace, monospace",
+      fontSize: "11px",
+      color: "#ffffff",
+      align: "center",
+      wordWrap: { width: boxWidth - 24 },
+    });
+    messageText.setOrigin(0.5, 0.5);
+
+    this._messageBox.add([outerBorder, innerBg, innerBorder, messageText]);
 
     this.time.delayedCall(2500, () => {
-      if (this._messageText) {
-        this._messageText.destroy();
-        this._messageText = null;
+      if (this._messageBox) {
+        this._messageBox.destroy();
+        this._messageBox = null;
       }
     });
   }
