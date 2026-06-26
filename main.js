@@ -11,6 +11,7 @@ const TILEMAP_JSON_URL = "Maps/wholemap.json"; // export your growing Tiled worl
 // the easiest path is to copy that image into your project and set TILESET_IMAGE_URL to it.
 const TILESET_IMAGE_URL = "Tilesets/spelunky_shop.png";
 const WORMY_TILESET_IMAGE_URL = "Tilesets/wormy_tiles.png";
+const WATER_TILESET_IMAGE_URL = "assets/water_sprite_sheet.png";
 /** Defaults for external .tsx tilesets referenced in map JSON (no embedded copy in export). */
 const TILESET_SPECS = {
   spelunky_shop: {
@@ -28,17 +29,44 @@ const TILESET_SPECS = {
   wormy_tiles: {
     textureKey: "wormy_tiles",
     image: WORMY_TILESET_IMAGE_URL,
-    columns: 6,
+    columns: 7,
     tilewidth: 16,
     tileheight: 16,
-    tilecount: 6,
-    imagewidth: 96,
+    tilecount: 7,
+    imagewidth: 112,
     imageheight: 16,
     margin: 0,
     spacing: 0,
   },
+  water: {
+    textureKey: "water",
+    image: WATER_TILESET_IMAGE_URL,
+    columns: 2,
+    tilewidth: 16,
+    tileheight: 16,
+    tilecount: 3,
+    imagewidth: 32,
+    imageheight: 32,
+    margin: 0,
+    spacing: 0,
+    /** Phaser plays this when the animated tile is painted in Tiled (tile id 0). */
+    tiles: [
+      {
+        id: 0,
+        animation: [
+          { tileid: 0, duration: 300 },
+          { tileid: 1, duration: 300 },
+          { tileid: 2, duration: 300 },
+        ],
+      },
+    ],
+  },
 };
 const COLLISION_LAYER_NAME = "Collisions"; // alternatively use layer property: collides=true
+/** Paint swimmable water (animated surface + body) on this layer in Tiled. */
+const HAZARDS_LAYER_NAME = "Hazards";
+/** Energy lost per second while the player overlaps a Hazards tile. */
+const WATER_ENERGY_DRAIN_PER_SEC = 10;
 
 // Used only when the map has no object named "Spawn" on layer "Objects".
 // Tile column / row in 0-based indices — same numbers Tiled shows when you hover a tile (not 1-based).
@@ -66,7 +94,7 @@ const PLAYER_BODY_OFFSET_X = 0;
 const PLAYER_BODY_OFFSET_Y = 0;
 
 // Classic Dizzy-like feel: constant walk speed (no horizontal accel), strong gravity, modest jump.
-const PHYS_GRAVITY_Y = 440;
+const PHYS_GRAVITY_Y = 420;
 const PHYS_WALK_SPEED_X = 60;
 const PHYS_MAX_SPEED_Y = 200;
 // Peak jump height ∝ velocity² at fixed gravity — ×2 height ⇒ velocity × √2
@@ -92,6 +120,7 @@ const ENERGY_BAR_ANIM_MS = 350;
 /**
  * World/inventory item types. Set `image` for sprite art; omit `image` and set `color` for a placeholder tile.
  * In Tiled, place point objects on the Items layer with property itemType matching the key below.
+ * Optional property hiddenUntil: item stays hidden until that item type is picked up (stacked pickups).
  */
 const ITEM_DEFINITIONS = {
   key: { name: "Key", image: "assets/item_key.png" },
@@ -110,6 +139,11 @@ const INTERACTION_USE_MARGIN = 12;
 
 const START_ENERGY = MAX_ENERGY;
 const START_LIVES = 3;
+const LIVES_ICON_SIZE = 12;
+const LIVES_ICON_GAP = 2;
+const LIVES_ICON_TEXTURE = "life_worm_face";
+/** Matches the orange worm sprite (`assets/wormy_spritesheet.png`). */
+const WORM_BODY_COLOR = "#ff7520";
 const RESPAWN_INVULN_MS = 2000;
 /** Falls shorter than this (px) do not drain energy. */
 const FALL_DAMAGE_MIN_PX = 48;
@@ -248,6 +282,11 @@ class MainScene extends Phaser.Scene {
     this.collidableLayers = [];
     /** TilemapLayer instances by Tiled layer name (for removeTileAt etc.). */
     this.tilemapLayersByName = new Map();
+    this._tileAnimationLookup = null;
+    this._animatedMapTiles = [];
+    this._waterTileGids = null;
+    this._hazardsLayer = null;
+    this._waterDrainDebt = 0;
     this.selectedInventorySlot = 0;
     this._inventoryReturnSlot = 0;
     this.spawnX = 0;
@@ -255,7 +294,7 @@ class MainScene extends Phaser.Scene {
     this.energy = START_ENERGY;
     this.lives = START_LIVES;
     this.statusUI = null;
-    this._livesText = null;
+    this._lifeIcons = [];
     this._energyBarFill = null;
     this._isDead = false;
     this._invulnerableUntil = 0;
@@ -265,6 +304,7 @@ class MainScene extends Phaser.Scene {
   preload() {
     this.load.image("tiles", TILESET_IMAGE_URL);
     this.load.image("wormy_tiles", WORMY_TILESET_IMAGE_URL);
+    this.load.image("water", WATER_TILESET_IMAGE_URL);
     for (const [itemId, def] of Object.entries(ITEM_DEFINITIONS)) {
       if (def.image) this.load.image(`item_${itemId}`, def.image);
     }
@@ -283,7 +323,10 @@ class MainScene extends Phaser.Scene {
   create() {
     this._ensurePlayerTexture();
     this._createItemTextures();
+    this._createLifeIconTexture();
     this._createPlayerAnimations();
+
+    this.events.on(Phaser.Scenes.Events.POST_UPDATE, this._snapPlayerToPixels, this);
 
     this.cameras.main.setBackgroundColor(0x121926);
 
@@ -300,6 +343,7 @@ class MainScene extends Phaser.Scene {
     }
 
     const mapJson = this._normalizeTiledTilesets(this.cache.json.get("mapJson"));
+    this._tileAnimationLookup = this._buildTileAnimationLookup(mapJson);
     this.cache.tilemap.add("map", { format: Phaser.Tilemaps.Formats.TILED_JSON, data: mapJson });
 
     // Build the tilemap (embedded tilesets)
@@ -337,6 +381,9 @@ class MainScene extends Phaser.Scene {
         this.tilemapLayersByName.set(layerName, layer);
       }
     }
+
+    this._setupAnimatedMapTiles(createdLayers);
+    this._initWaterHazards(mapJson);
 
     // World bounds based on map pixel size
     const worldW = this.map.widthInPixels;
@@ -435,7 +482,26 @@ class MainScene extends Phaser.Scene {
     this._focusGameCanvas();
   }
 
-  update() {
+  /** Keep the player on whole pixels (and tile rows when grounded) to avoid blur/flicker. */
+  _snapPlayerToPixels() {
+    if (!this.player?.body || this._isDead) return;
+
+    const body = this.player.body;
+    const onGround = body.blocked.down || body.touching.down;
+    const tileHeight = this.map?.tileHeight ?? 16;
+
+    const x = Math.round(this.player.x);
+    const y = onGround ? Math.round(this.player.y / tileHeight) * tileHeight : Math.round(this.player.y);
+    if (this.player.x === x && this.player.y === y) return;
+
+    this.player.setPosition(x, y);
+    body.updateFromGameObject();
+    if (onGround && Math.abs(body.velocity.y) < 1) body.setVelocityY(0);
+  }
+
+  update(time, delta) {
+    this._updateAnimatedMapTiles(delta);
+
     if (!this.player) return;
     const body = this.player.body;
 
@@ -497,6 +563,7 @@ class MainScene extends Phaser.Scene {
     this._updatePlayerAnimation(onGround);
 
     this._updateFallDamage(onGround);
+    this._updateWaterHazard(delta);
 
     this._setActiveRoomForPlayer(false);
     this._updateRoomCamera();
@@ -537,6 +604,7 @@ class MainScene extends Phaser.Scene {
     this.roomCamTarget = { x: 0, y: 0 };
     this.activeRoomId = "Fallback";
     cam.setScroll(0, 0);
+    cam.roundPixels = true;
 
     if (message) {
       this.add
@@ -596,7 +664,7 @@ class MainScene extends Phaser.Scene {
   _ensurePlayerTexture() {
     if (this.textures.exists("player")) return;
     const tex = this.textures.createCanvas("player", PLAYER_WIDTH, PLAYER_HEIGHT);
-    tex.context.fillStyle = "#5fd38d";
+    tex.context.fillStyle = WORM_BODY_COLOR;
     tex.context.fillRect(0, 0, PLAYER_WIDTH, PLAYER_HEIGHT);
     tex.refresh();
   }
@@ -672,6 +740,7 @@ class MainScene extends Phaser.Scene {
         embeddedTilesets.find((ts) => ts.name === sourceName) || embeddedTilesets[0] || spec;
       const name = this._uniqueTilesetName(sourceName || "tileset", usedNames, tileset.firstgid);
       usedNames.add(name);
+      const tiles = template.tiles ?? spec.tiles;
 
       return {
         columns: template.columns ?? spec.columns ?? 1,
@@ -685,6 +754,7 @@ class MainScene extends Phaser.Scene {
         tilecount: template.tilecount ?? spec.tilecount,
         tileheight: template.tileheight ?? spec.tileheight ?? normalized.tileheight,
         tilewidth: template.tilewidth ?? spec.tilewidth ?? normalized.tilewidth,
+        ...(tiles ? { tiles } : {}),
       };
     });
 
@@ -703,6 +773,147 @@ class MainScene extends Phaser.Scene {
     return normalized;
   }
 
+  /** Map GID → Tiled tile animation (Phaser does not auto-play these). */
+  _buildTileAnimationLookup(mapJson) {
+    const lookup = new Map();
+    if (!mapJson?.tilesets) return lookup;
+
+    for (const tileset of mapJson.tilesets) {
+      if (!tileset.tiles?.length || tileset.firstgid == null) continue;
+
+      for (const tile of tileset.tiles) {
+        if (!tile.animation?.length) continue;
+
+        const frames = tile.animation.map((frame) => ({
+          gid: tileset.firstgid + frame.tileid,
+          duration: frame.duration,
+        }));
+        const totalDuration = frames.reduce((sum, frame) => sum + frame.duration, 0);
+        const anim = { frames, totalDuration };
+
+        lookup.set(tileset.firstgid + tile.id, anim);
+        for (const frame of tile.animation) {
+          lookup.set(tileset.firstgid + frame.tileid, anim);
+        }
+      }
+    }
+
+    return lookup;
+  }
+
+  _setupAnimatedMapTiles(layers) {
+    this._animatedMapTiles = [];
+    if (!this._tileAnimationLookup?.size) return;
+
+    for (const layer of layers) {
+      layer.forEachTile((tile) => {
+        if (!tile || tile.index <= 0) return;
+        const anim = this._tileAnimationLookup.get(tile.index);
+        if (!anim) return;
+
+        this._animatedMapTiles.push({
+          layer,
+          tileX: tile.x,
+          tileY: tile.y,
+          anim,
+          elapsed: ((tile.x + tile.y) * 97) % anim.totalDuration,
+        });
+      });
+    }
+  }
+
+  _updateAnimatedMapTiles(delta) {
+    if (!this._animatedMapTiles?.length) return;
+
+    for (const entry of this._animatedMapTiles) {
+      entry.elapsed = (entry.elapsed + delta) % entry.anim.totalDuration;
+
+      let remaining = entry.elapsed;
+      let gid = entry.anim.frames[0].gid;
+      for (const frame of entry.anim.frames) {
+        if (remaining < frame.duration) {
+          gid = frame.gid;
+          break;
+        }
+        remaining -= frame.duration;
+      }
+
+      const current = entry.layer.getTileAt(entry.tileX, entry.tileY);
+      if (current && current.index !== gid) {
+        entry.layer.putTileAt(gid, entry.tileX, entry.tileY);
+      }
+    }
+  }
+
+  _initWaterHazards(mapJson) {
+    this._waterTileGids = this._buildWaterTileGids(mapJson);
+    this._hazardsLayer = this.tilemapLayersByName.get(HAZARDS_LAYER_NAME) || null;
+  }
+
+  /** GIDs for static/animated water art (fallback when Hazards layer is absent). */
+  _buildWaterTileGids(mapJson) {
+    const gids = new Set();
+    if (!mapJson?.tilesets) return gids;
+
+    for (const tileset of mapJson.tilesets) {
+      const baseName = this._tilesetBaseName(tileset.name);
+      const firstgid = tileset.firstgid ?? 1;
+      const tilecount = tileset.tilecount ?? 0;
+
+      if (baseName === "water") {
+        for (let i = 0; i < tilecount; i++) gids.add(firstgid + i);
+      }
+      if (baseName === "wormy_tiles") {
+        gids.add(firstgid + 6);
+      }
+    }
+
+    return gids;
+  }
+
+  _isPlayerInWater() {
+    if (!this.player || !this.map) return false;
+
+    const sampleYs = [this.player.y - 4, this.player.y - 12];
+    if (this._hazardsLayer) {
+      for (const py of sampleYs) {
+        const tile = this._hazardsLayer.getTileAtWorldXY(this.player.x, py);
+        if (tile && tile.index > 0) return true;
+      }
+      return false;
+    }
+
+    if (!this._waterTileGids?.size) return false;
+
+    for (const layerName of ["Background"]) {
+      const layer = this.tilemapLayersByName.get(layerName);
+      if (!layer) continue;
+
+      for (const py of sampleYs) {
+        const tile = layer.getTileAtWorldXY(this.player.x, py);
+        if (tile && this._waterTileGids.has(tile.index)) return true;
+      }
+    }
+
+    return false;
+  }
+
+  _updateWaterHazard(delta) {
+    if (this._isDead || this.time.now < this._invulnerableUntil) return;
+
+    if (!this._isPlayerInWater()) {
+      this._waterDrainDebt = 0;
+      return;
+    }
+
+    this._waterDrainDebt += (WATER_ENERGY_DRAIN_PER_SEC * delta) / 1000;
+    if (this._waterDrainDebt < 1) return;
+
+    const drain = Math.floor(this._waterDrainDebt);
+    this._waterDrainDebt -= drain;
+    this._changeEnergy(-drain);
+  }
+
   _filenameWithoutExtension(path) {
     const filename = path.split(/[\\/]/).pop() || "";
     return filename.replace(/\.[^.]+$/, "");
@@ -711,6 +922,7 @@ class MainScene extends Phaser.Scene {
   _tilesetBaseName(tilesetName) {
     if (tilesetName.startsWith("wormy_tiles")) return "wormy_tiles";
     if (tilesetName.startsWith("spelunky_shop")) return "spelunky_shop";
+    if (tilesetName.startsWith("water")) return "water";
     return tilesetName.replace(/_\d+$/, "");
   }
 
@@ -907,6 +1119,41 @@ class MainScene extends Phaser.Scene {
       ctx.strokeRect(0, 0, 12, 12);
       this.textures.addBase64(texKey, canvas.toDataURL());
     }
+  }
+
+  _createLifeIconTexture() {
+    if (this.textures.exists(LIVES_ICON_TEXTURE)) {
+      this.textures.remove(LIVES_ICON_TEXTURE);
+    }
+
+    const size = LIVES_ICON_SIZE;
+    const tex = this.textures.createCanvas(LIVES_ICON_TEXTURE, size, size);
+    const ctx = tex.context;
+    ctx.clearRect(0, 0, size, size);
+
+    // Pixel-art face (O = body, E = eye) — avoids anti-aliased arcs looking different per icon.
+    const face = [
+      "0011111100",
+      "0111111110",
+      "1111111111",
+      "1111111111",
+      "1111E11E11",
+      "1111111111",
+      "0111111110",
+      "0011111100",
+    ];
+
+    for (let row = 0; row < face.length; row++) {
+      for (let col = 0; col < face[row].length; col++) {
+        const cell = face[row][col];
+        if (cell === "0") continue;
+        ctx.fillStyle = cell === "E" ? "#000000" : WORM_BODY_COLOR;
+        ctx.fillRect(col + 1, row + 2, 1, 1);
+      }
+    }
+
+    tex.setFilter(Phaser.Textures.FilterMode.NEAREST);
+    tex.refresh();
   }
 
   _getTiledProperty(obj, name, defaultValue) {
@@ -1203,27 +1450,29 @@ class MainScene extends Phaser.Scene {
     this.statusUI.setScrollFactor(0);
     this.statusUI.setDepth(9998);
 
-    this._livesText = this.add.text(hudX, hudY, "", {
-      fontFamily: "ui-monospace, monospace",
-      fontSize: "10px",
-      color: "#ffffff",
-    });
-    this._livesText.setOrigin(0, 0);
+    this._lifeIcons = [];
+    for (let i = 0; i < START_LIVES; i++) {
+      const iconX = Math.round(hudX + i * (LIVES_ICON_SIZE + LIVES_ICON_GAP) + LIVES_ICON_SIZE / 2);
+      const iconY = Math.round(hudY + LIVES_ICON_SIZE / 2);
+      const icon = this.add.image(iconX, iconY, LIVES_ICON_TEXTURE);
+      icon.setOrigin(0.5, 0.5);
+      this._lifeIcons.push(icon);
+    }
 
-    const energyLabel = this.add.text(hudX, hudY + 14, "Energy", {
+    const energyLabel = this.add.text(hudX, hudY + 16, "Energy", {
       fontFamily: "ui-monospace, monospace",
       fontSize: "8px",
       color: "#aaaaaa",
     });
     energyLabel.setOrigin(0, 0);
 
-    const energyBarBg = this.add.rectangle(hudX, hudY + 26, ENERGY_BAR_WIDTH, barHeight, 0x2d2d44);
+    const energyBarBg = this.add.rectangle(hudX, hudY + 28, ENERGY_BAR_WIDTH, barHeight, 0x2d2d44);
     energyBarBg.setOrigin(0, 0);
 
-    this._energyBarFill = this.add.rectangle(hudX, hudY + 26, ENERGY_BAR_WIDTH, barHeight, 0x5fd38d);
+    this._energyBarFill = this.add.rectangle(hudX, hudY + 28, ENERGY_BAR_WIDTH, barHeight, 0x5fd38d);
     this._energyBarFill.setOrigin(0, 0);
 
-    this.statusUI.add([this._livesText, energyLabel, energyBarBg, this._energyBarFill]);
+    this.statusUI.add([...this._lifeIcons, energyLabel, energyBarBg, this._energyBarFill]);
     this._updateStatusUI();
   }
 
@@ -1232,9 +1481,15 @@ class MainScene extends Phaser.Scene {
   }
 
   _updateStatusUI({ animateEnergy = false } = {}) {
-    if (!this._livesText || !this._energyBarFill) return;
+    if (!this._lifeIcons?.length || !this._energyBarFill) return;
 
-    this._livesText.setText(`Lives ${this.lives}`);
+    for (let i = 0; i < this._lifeIcons.length; i++) {
+      const alive = i < this.lives;
+      const icon = this._lifeIcons[i];
+      icon.setAlpha(alive ? 1 : 0.25);
+      if (alive) icon.clearTint();
+      else icon.setTint(0x888888);
+    }
 
     const ratio = Phaser.Math.Clamp(this.energy / MAX_ENERGY, 0, 1);
     const targetWidth = Math.max(0, ENERGY_BAR_WIDTH * ratio);
@@ -1288,7 +1543,7 @@ class MainScene extends Phaser.Scene {
       return;
     }
 
-    this._showGameMessage("Ouch!");
+    this._showGameMessage("You lose a life!");
     this._respawnPlayer();
   }
 
@@ -1366,22 +1621,47 @@ class MainScene extends Phaser.Scene {
     if (!itemsLayer || !itemsLayer.objects) return;
 
     for (const obj of itemsLayer.objects) {
-      const itemType = obj.properties?.find((p) => p.name === "itemType")?.value || obj.name || "key";
+      const itemType = this._getTiledProperty(obj, "itemType", obj.name || "key");
       const x = this._tiledObjectCenterX(obj, this.map.tileWidth);
       const y = this._tiledObjectFootY(obj);
-      this._createWorldItem(x, y, itemType);
+      const hiddenUntil = this._getTiledProperty(obj, "hiddenUntil", "");
+      const depth = Number(this._getTiledProperty(obj, "depth", DEPTH_WORLD_ITEMS)) || DEPTH_WORLD_ITEMS;
+      this._createWorldItem(x, y, itemType, { hiddenUntil, depth });
     }
   }
 
-  _createWorldItem(x, y, itemType) {
+  _createWorldItem(x, y, itemType, options = {}) {
     const texKey = `item_${itemType}`;
     if (!this.textures.exists(texKey)) return;
 
     const item = this.worldItems.create(x, y, texKey);
     item.setOrigin(0.5, 1);
-    item.setDepth(DEPTH_WORLD_ITEMS);
+    item.setDepth(options.depth ?? DEPTH_WORLD_ITEMS);
     item.refreshBody();
     item.setData("itemType", itemType);
+    item.setData("hiddenUntil", options.hiddenUntil || "");
+    if (options.hiddenUntil) this._hideWorldItem(item);
+  }
+
+  _hideWorldItem(item) {
+    item.setVisible(false);
+    item.setActive(false);
+    if (item.body) item.body.enable = false;
+  }
+
+  _revealItemsUnlockedBy(pickedUpType) {
+    if (!pickedUpType || !this.worldItems) return;
+
+    for (const item of this.worldItems.getChildren()) {
+      if (item.getData("hiddenUntil") !== pickedUpType) continue;
+      item.setVisible(true);
+      item.setActive(true);
+      if (item.body) {
+        item.body.enable = true;
+        item.refreshBody();
+      }
+      item.setData("hiddenUntil", "");
+    }
   }
 
   _pickupNearbyItem() {
@@ -1411,9 +1691,10 @@ class MainScene extends Phaser.Scene {
 
     if (itemDef?.consumeOnPickup) {
       nearestItem.destroy();
+      this._revealItemsUnlockedBy(itemType);
       if (itemDef.energyOnPickup) {
         this._changeEnergy(itemDef.energyOnPickup);
-        this._showGameMessage(`+${itemDef.energyOnPickup} energy`);
+        this._showGameMessage("Yum yum!");
       }
       return "consumed";
     }
@@ -1422,6 +1703,7 @@ class MainScene extends Phaser.Scene {
 
     this.inventory.push(itemType);
     nearestItem.destroy();
+    this._revealItemsUnlockedBy(itemType);
     this._updateInventoryUI();
     return "inventory";
   }
@@ -1474,9 +1756,11 @@ class MainScene extends Phaser.Scene {
     const panelY = this.inventoryUI.getData("panelY");
     const panelWidth = this.inventoryUI.getData("panelWidth");
     const itemDefs = this._getItemDefinitions();
+    const slotPitch = 50;
+    const slotsStartX = panelX + panelWidth / 2 - ((this.inventoryMaxSize - 1) * slotPitch) / 2;
 
     for (let i = 0; i < this.inventoryMaxSize; i++) {
-      const slotX = panelX + 30 + i * 50;
+      const slotX = slotsStartX + i * slotPitch;
       const slotY = panelY + 50;
 
       const slotBg = this.add.rectangle(slotX, slotY, 40, 40, 0x2d2d44);
@@ -1637,7 +1921,11 @@ const config = {
     // Match parent width; height follows the exact 24×13-tile game screen aspect.
     mode: Phaser.Scale.WIDTH_CONTROLS_HEIGHT,
     autoCenter: Phaser.Scale.CENTER_BOTH,
-    autoRound: false,
+    autoRound: true,
+  },
+  render: {
+    antialias: false,
+    roundPixels: true,
   },
   physics: {
     default: "arcade",

@@ -1,0 +1,54 @@
+---
+description: Wormy game — stack, Tiled map conventions, and coding patterns
+alwaysApply: true
+---
+
+# Wormy project context
+
+The name of the character/player is Wormy.
+8-bit Dizzy-style adventure: **Phaser 3** + **Tiled**, single entry point `main.js`, map at `Maps/wholemap.json`.
+
+Run via local server (`python3 -m http.server 8080`) — `file://` breaks asset loading.
+
+## World scale
+
+- Tiles: **16×16 px**
+- One screen: **24×13 tiles** (384×208 px); extend map width in multiples of 24
+- Player sprite and physics body: **native 16×16** — do not scale sprites down (breaks Arcade body offsets/collisions)
+
+## Tiled layers (tile layers)
+
+| Layer | Purpose |
+|-------|---------|
+| `Background` | Visual scenery (ground, props, static art) |
+| `Collisions` | Solid tiles — or any layer with property `collides=true` |
+| `Hazards` | **All water**: animated surface + static body. Swimming + energy drain. No separate `Water` layer. |
+
+**Water setup:** Paint the full pool on `Hazards`. Use animated water tile (tileset `water`, firstgid ~28) for the surface and static `Water` tile from `wormy_tiles` (tile id 6, gid ~27) for the body. Leave the water column **empty on `Collisions`** so the worm can enter. Energy drains at `WATER_ENERGY_DRAIN_PER_SEC` (10/s) while overlapping hazard tiles.
+
+Phaser does not auto-play Tiled tile animations — animated water is driven manually in `_setupAnimatedMapTiles` / `_updateAnimatedMapTiles`.
+
+## Tiled object layers
+
+| Layer | Purpose |
+|-------|---------|
+| `Objects` | Optional `Spawn` object (else `DEFAULT_SPAWN_TILE` in `main.js`) |
+| `Items` | Point objects with `itemType` matching `ITEM_DEFINITIONS`; optional `hiddenUntil` for stacked pickups |
+| `Interactions` | Puzzle zones — see README for `action`, `requiredItem`, `target`, states |
+
+## Tilesets
+
+- `spelunky_shop`, `wormy_tiles`, `water` — see `TILESET_SPECS` in `main.js` for external `.tsx` normalization
+- Export map as **JSON** (not `.tmx`); embedded tilesets in JSON work out of the box
+
+## Code conventions
+
+- Tune gameplay via top-of-file constants in `main.js` (physics, energy, layers, URLs)
+- New puzzle behaviours: add handlers to `INTERACTION_HANDLERS`; new items: `ITEM_DEFINITIONS`
+- Bump `main.js?v=…` in `index.html` when testing cache-sensitive changes
+- Keep diffs minimal; match existing style; don't commit unless the user asks
+
+## Docs
+
+- `README.md` — interactions, inventory, Tiled export, controls
+- `SPRITE_INSTRUCTIONS.md` — player sprite sheet setup
